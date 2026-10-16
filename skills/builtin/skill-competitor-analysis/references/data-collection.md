@@ -18,6 +18,7 @@
 ## 采集顺序（逐级降级）
 
 1. **主页直取** — `web_fetch` 账号主页链接，提取简介、粉丝量级、近期作品标题与互动量级。
+   **小红书例外：必须走下面的专用脚本，不要用 `web_fetch`。**
 2. **搜索补全** — 主页被反爬拦截（返回验证码/空内容）时，改用 `web_search`：
    - `{账号昵称} {平台}` — 找账号介绍、第三方榜单收录
    - `site:xiaohongshu.com {账号昵称}` / `{账号昵称} 爆款` — 定位代表作
@@ -25,11 +26,59 @@
 3. **样本抽取** — 无法拉全量作品时，抽取近期 10–20 篇代表内容手动归类，标注"基于样本，非全量统计"。
 4. **热点交叉** — 借势分析走热搜 API，参照 [hotlist-apis.md](../../../shared/hotlist-apis.md)，不在本文件复制端点。
 
-## 各平台反爬现状与降级
+## 小红书：必须用 `xhs_fetch.py`（带登录态）
+
+```bash
+python skills/shared/scripts/xhs_fetch.py \
+  --user-id <24位user_id> --limit 50 \
+  --json outputs/_scratch/xhs_<账号>.json
+```
+
+节流默认走 Steady 档（10–30s），**无需显式传参**；不要为了快而调低。
+
+`user_id` 从主页 URL 取：`xiaohongshu.com/user/profile/<user_id>`。
+
+**为什么不能用 `web_fetch` / 浏览器导航**（2026-10-16 实测，同一账号同一时刻）：
+
+| 方式 | 结果 |
+|------|------|
+| `ctx.request.get()` + 登录态 profile | ✅ 200 / 185 KB / 昵称 + 12 篇作品 |
+| `ctx.request.get()` 匿名 | ❌ 10 KB 空壳，0 篇 |
+| 浏览器 `page.goto()`（即使带登录态） | ❌ 跳 `/login` 或 `/website-login/error` |
+
+**关键结论：小红书主页数据只能通过「带登录态的 request 请求」拿到，页面导航一定被拦。**
+脚本已按「登录态优先 → 匿名回退」实现，并内置节流与熔断器。
+
+### 能力边界（不要对用户承诺全量）
+
+- **只能拿到 SSR 内嵌的第一页，实测 12 篇。** 更深翻页要走
+  `/api/sns/web/v1/user_posted`，该接口要求签名头 `x-s` / `x-t`，**Easel 没有该实现，
+  一律返回 HTTP 406**。所以 `--limit 50` 是「上限」而不是「保证」。
+- 报告里必须写清实际覆盖数（如"SSR 首页 12 篇"），**不要**把 `--limit 50` 说成"分析了 50 篇"。
+- 粉丝/获赞与收藏是**量级字符串**（`1万+`），不是精确值，照抄量级即可，不要换算成精确数字。
+- `noteCard.noteId` 可能为空，作品 ID 在条目自身的 `id` 字段。
+
+### 节流与熔断（不可协商）
+
+竞品分析读多篇笔记属于研究性读取，节流规则以
+[skill-xhs-analyzer/references/research-loop.md](../../../builtin/skill-xhs-analyzer/references/research-loop.md)
+为准：串行、一次一篇、随机 jitter、**绝不并行**。
+
+✅ **速率档位**：该文档的默认档是 **Steady（20 s ± 50% ≈ 10–30 s）**，并把 **<5 s** 归为需要
+用户显式 opt-in 的 **Fast** 档。`xhs_fetch.py` **默认就是 Steady 档**，与安全默认一致 ——
+正常调用不要传 `--min-delay/--max-delay`。只有用户明确接受风控风险时才提速，
+且 `--max-delay < 5` 会打印 Fast 档警告。文档还指出匀速低方差本身就是机器签名，所以 jitter 不可省。
+
+熔断器是绝对的：出现 `300012` / `NeedVerify` / 验证码 / 跳登录 / 会话失效，脚本立即停止并返回
+exit code 2，**绝不自动重试**。遇到熔断就如实报告并停止本轮采集，等用户处理后再继续 ——
+重试会把软节流升级成数小时封禁。
+
+### 其它平台
+
 
 | 平台 | 主页 web_fetch | 降级方案 |
 |------|---------------|---------|
-| 小红书 | ⚠️ 常需登录态，易返回空 | 改 `web_search site:xiaohongshu.com`，取搜索摘要与第三方收录 |
+| 小红书 | ❌ **不要 `web_fetch`**（浏览器导航必被拦） | **用 `skills/shared/scripts/xhs_fetch.py`**（带登录态，见上节）；仍取不到再退 `web_search site:xiaohongshu.com` |
 | 抖音 | ⚠️ 视频页反爬强 | 用抖音号搜索 + 第三方榜单（如新抖类公开报道）取量级 |
 | B站 | ⚠️ 服务器 IP 返回 -352 / 验证码 | **不要 fetch 视频页**；用 `web_search` 取 UP 主公开数据、三连量级 |
 | 微博 | ✅ 相对宽松 | 主页多可直取，翻页受限时用搜索补全 |

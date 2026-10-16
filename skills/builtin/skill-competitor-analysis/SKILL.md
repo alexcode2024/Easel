@@ -73,6 +73,10 @@ layer: discover
 
 对每个竞品账号建立基础画像。数据采集方法与各平台反爬降级方案参照 [data-collection.md](references/data-collection.md)：
 - 用 `web_fetch` 抓取账号主页信息（账号简介、粉丝量级、作品数）；被反爬拦截时降级到 `web_search` 取公开信息
+  - **小红书例外**：不要用 `web_fetch`，改用
+    `python skills/shared/scripts/xhs_fetch.py --user-id <id> --limit 50 --json <out>`
+    （带登录态、内置节流与熔断）。实测浏览器导航必被跳登录，只有带登录态的 request 请求能拿到数据；
+    且只能拿到 SSR 首页约 12 篇 —— 报告必须写清实际覆盖数，不要把 `--limit 50` 说成"分析了 50 篇"。
 - 提取定位关键词、内容方向、人设特征
 - 记录粉丝量级区间、账号活跃度
 - 拿不到的数据（播放/完播/粉丝增量等创作者后台数据）如实标注"无公开数据"，不编造精确值

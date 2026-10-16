@@ -15,6 +15,9 @@ build/
 # setup.sh 默认把 Python 依赖装进项目内的 .venv（见 setup.sh 的虚拟环境分支）
 .venv/
 
+# 本机部署辅助脚本与记录（非上游内容，见 DEPLOYMENT.md）
+.deploy/
+
 # Docker
 docker/data/
 

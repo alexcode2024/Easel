@@ -322,11 +322,27 @@ textarea.field { resize: vertical; min-height: 90px; }
   animation: fadeIn 0.18s var(--ease);
 }
 .drawer {
-  width: 560px; max-width: 92vw; height: 100%;
+  /* --drawer-w is set inline by useDrawerWidth(); the literal is the fallback
+     and keeps the historical 560px default when nothing has been persisted.
+     `position: relative` anchors the absolutely-positioned .drawer-resizer. */
+  position: relative;
+  width: var(--drawer-w, 560px); max-width: 92vw; height: 100%;
   background: var(--surface); border-left: 1px solid var(--border);
   box-shadow: var(--shadow-lg); overflow-y: auto;
   animation: slideInRight 0.24s var(--ease);
 }
+/* Left-edge drag strip: the drawer is pinned right, so the free edge is left. */
+.drawer-resizer {
+  position: absolute; left: 0; top: 0; bottom: 0; width: 6px;
+  cursor: col-resize; z-index: 3; touch-action: none;
+  background: transparent; border: none; padding: 0;
+  transition: background 0.15s var(--ease);
+}
+/* Highlight on hover/focus/drag. Uses --accent-start: this theme defines
+   --accent-start / --accent-end, there is no bare --accent. */
+.drawer-resizer:hover,
+.drawer-resizer:focus-visible,
+.drawer-resizer:active { background: var(--accent-start); opacity: 0.55; outline: none; }
 .drawer-header {
   position: sticky; top: 0; z-index: 2;
   background: var(--surface); border-bottom: 1px solid var(--border);

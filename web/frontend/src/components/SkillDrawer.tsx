@@ -3,6 +3,7 @@ import { fetchSkillDetail, executeSkill, saveEnv } from '../lib/api';
 import type { SkillDetail } from '../lib/api';
 import { renderMarkdown } from '../lib/sanitize';
 import { displayName } from '../lib/skillDisplayNames';
+import { useDrawerWidth } from '../lib/useDrawerWidth';
 
 interface SkillDrawerProps {
   skillName: string;
@@ -14,6 +15,7 @@ interface SkillDrawerProps {
 export default function SkillDrawer({ skillName, persona, onClose, onConfigured }: SkillDrawerProps) {
   const [detail, setDetail] = useState<SkillDetail | null>(null);
   const [loadErr, setLoadErr] = useState('');
+  const drawer = useDrawerWidth();
 
   // API 配置输入（env -> 明文，只提交非空项）
   const [envInputs, setEnvInputs] = useState<Record<string, string>>({});
@@ -83,7 +85,8 @@ export default function SkillDrawer({ skillName, persona, onClose, onConfigured 
 
   return (
     <div className="drawer-overlay" onClick={onClose}>
-      <div className="drawer" onClick={(e) => e.stopPropagation()}>
+      <div className="drawer" style={drawer.style} onClick={(e) => e.stopPropagation()}>
+        <div className="drawer-resizer" {...drawer.handleProps} />
         <div className="drawer-header">
           <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 12 }}>
             <div>

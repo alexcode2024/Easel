@@ -3,6 +3,7 @@ import type { CSSProperties } from 'react';
 import { fetchOutputs, fetchOutputContent, mediaUrl, deleteOutput } from '../lib/api';
 import type { OutputNode, OutputMeta } from '../lib/api';
 import { renderMarkdown } from '../lib/sanitize';
+import { useDrawerWidth } from '../lib/useDrawerWidth';
 import { IconOutputs, IconImage, IconVideo, IconMusic, IconFile, IconFolder, IconRefresh, IconChevron, IconTrash } from './icons';
 
 const FILTERS: { key: string; label: string }[] = [
@@ -90,6 +91,7 @@ export default function OutputsPage({ jumpPath, onJumpHandled }: OutputsPageProp
   const [content, setContent] = useState('');
   const [loading, setLoading] = useState(false);
   const reqSeq = useRef(0);
+  const drawer = useDrawerWidth();
 
   const load = useCallback(() => {
     setTreeError('');
@@ -320,7 +322,8 @@ export default function OutputsPage({ jumpPath, onJumpHandled }: OutputsPageProp
 
       {selected && (
         <div className="drawer-overlay" onClick={() => setSelected(null)}>
-          <div className="drawer" onClick={(e) => e.stopPropagation()}>
+          <div className="drawer" style={drawer.style} onClick={(e) => e.stopPropagation()}>
+            <div className="drawer-resizer" {...drawer.handleProps} />
             <div className="drawer-header" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
               <div style={{ minWidth: 0 }}>
                 <div className="skill-detail-title" style={{ fontSize: 16 }}>{selected.name}</div>
