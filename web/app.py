@@ -4,7 +4,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import mimetypes
+import math
 import os
+import random
 if os.name == "nt":
     import msvcrt
 else:
@@ -4173,8 +4175,14 @@ def _write_login_marker(platform: str, state: str, message: str = '') -> None:
             pass
 
 
+# 小红书会话健康缓存：cookie 纯 HTTP 校验的结果（result/sessions/checked_at）。
+# 有它，/api/accounts 的快速路径才不会沿用早已失效的旧 QR 登录标记。
+_XHS_SESSION_CACHE: dict = {}
+
+
 def _account_logged_in(platform: str, cfg: dict) -> bool:
-    """尽力判断某平台是否已登录。
+    """尽量判断某平台是否已登录。
+
     浏览器平台的登录态只有启动浏览器才真能知道（profile 里总有 Cookies 文件，存在≠已登录，
     会误报），故这里只信「本流程最近一次登录成功」——即 status.json == success。
     biliup 的 cookies.json 只有登录成功才生成，可直接判。"""
@@ -4191,6 +4199,19 @@ def _account_logged_in(platform: str, cfg: dict) -> bool:
         except Exception:
             pass
         return _wechat_has_credentials()
+    if backend == 'xhs':
+        # 小红书优先信「cookie 纯 HTTP 校验」（快、无浏览器）；没配 cookie 才回退登录标记。
+        # 旧 QR 登录的 success 标记会一直躺着，即使主站会话早已失效——不能只信它。
+        if _bench_cookie_file('xiaohongshu'):
+            cached = _XHS_SESSION_CACHE.get('result')
+            if cached is None:
+                return _account_logged_in_by_marker(platform)
+            return bool(cached)
+    return _account_logged_in_by_marker(platform)
+
+
+def _account_logged_in_by_marker(platform: str) -> bool:
+    """只看登录标记文件（原有快速路径）。"""
     st = LOGIN_DIR / f'{platform}.json'
     if st.is_file():
         try:
@@ -4228,6 +4249,63 @@ def _login_status(platform: str) -> dict:
         data['qr'] = ''
         data['qrTs'] = 0
     return data
+
+
+@app.get("/api/accounts/{platform}/session")
+async def api_account_session(platform: str, check: bool = False):
+    """小红书会话健康：主站（读数据用）与创作平台（发布用）分别是什么状态。
+
+    ``check=1`` 时用 cookie 走一次**纯 HTTP** 校验（约 1 秒、不起浏览器）；
+    否则只回最近一次结果 + cookie 里静态能看出来的信息。
+    """
+    if platform not in LOGIN_RUNNERS:
+        raise HTTPException(404, '未知平台')
+    cfg = LOGIN_RUNNERS[platform]
+    cookie_file = _bench_cookie_file(platform) if cfg.get('backend') == 'xhs' else ''
+    out: dict = {
+        'platform': platform,
+        'cookie': _bench_cookie_status(platform) if platform in BENCH_COOKIE_PLATFORMS else None,
+        'checked_at': _XHS_SESSION_CACHE.get('checked_at'),
+        'web': None, 'creator': None,
+    }
+    if not cookie_file:
+        out['hint'] = ('还没有配置 cookie：可在「对标账号 / 自有账号」页右上角「🔑 Cookie」'
+                       '粘贴浏览器里复制的 cookie，之后小红书读数据与校验都不再需要浏览器')
+        return out
+    checked_now = False
+    if check or _XHS_SESSION_CACHE.get('sessions') is None:
+        cmd = [sys.executable, str(SHARED_SCRIPTS / 'xhs_publish.py'), 'whoami', '--no-proxy',
+               '--cookie-file', cookie_file]
+        try:
+            proc = await asyncio.to_thread(subprocess.run, cmd, cwd=str(PROJECT_ROOT),
+                                           env=_proxy_env(), capture_output=True, text=True,
+                                           encoding='utf-8', timeout=30)
+            for line in reversed((proc.stdout or '').strip().splitlines()):
+                if line.strip().startswith('{'):
+                    d = json.loads(line)
+                    _XHS_SESSION_CACHE.update({
+                        'result': bool(d.get('loggedIn')),
+                        'sessions': d.get('sessions') or {},
+                        'checked_at': int(time.time()), 'name': d.get('name') or ''})
+                    checked_now = True
+                    break
+        except subprocess.TimeoutExpired:
+            out['error'] = '校验超时'
+        except Exception as error:  # noqa: BLE001
+            out['error'] = f'{type(error).__name__}: {error}'
+    sessions = _XHS_SESSION_CACHE.get('sessions') or {}
+    out['web'] = sessions.get('web')
+    out['creator'] = sessions.get('creator')
+    out['logged_in'] = _XHS_SESSION_CACHE.get('result')
+    out['checked_at'] = _XHS_SESSION_CACHE.get('checked_at')
+    out['name'] = _XHS_SESSION_CACHE.get('name') or ''
+    # 把校验结果回写成登录标记：否则旧的扫码 success 标记会一直躺着，
+    # /api/accounts 冷启动时会显示「已登录」，与实测结果自相矛盾（实测踩到）。
+    if checked_now and out['logged_in'] is False:
+        _write_login_marker(platform, 'expired', 'cookie 已失效或被平台降级：请重新粘贴 cookie 或扫码')
+    elif checked_now and out['logged_in']:
+        _write_login_marker(platform, 'success', out['name'] or '')
+    return out
 
 
 @app.get("/api/accounts")
@@ -4548,6 +4626,10 @@ async def _check_account_whoami(platform: str, force: bool = False):
                '--cookie', str(PROJECT_ROOT / 'cookies.json')]
     elif backend == 'xhs':
         cmd = [sys.executable, str(SHARED_SCRIPTS / 'xhs_publish.py'), 'whoami', '--no-proxy']
+        _cookie_file = _bench_cookie_file('xiaohongshu')
+        if _cookie_file:
+            # 有 cookie 就走纯 HTTP 校验（秒级、不起浏览器），并顺带拿到两个会话的健康度
+            cmd += ['--cookie-file', _cookie_file]
     elif backend == 'wechat-oa':
         cmd = [sys.executable, str(SHARED_SCRIPTS / 'weixin_mp_stats.py'), 'whoami', '--no-proxy']
     elif backend == 'douyin':
@@ -4569,6 +4651,12 @@ async def _check_account_whoami(platform: str, force: bool = False):
             try:
                 d = json.loads(line)
                 data = {'loggedIn': bool(d.get('loggedIn')), 'name': d.get('name') or '', 'avatar': d.get('avatar') or ''}
+                if isinstance(d.get('sessions'), dict):
+                    # 纯 HTTP 校验会带回两个会话（主站 / 创作平台）的健康度
+                    data['sessions'] = d['sessions']
+                    _XHS_SESSION_CACHE.update({
+                        'result': data['loggedIn'], 'sessions': d['sessions'],
+                        'checked_at': int(time.time()), 'name': data['name']})
                 # 有 error 字段 = 校验本身失败（浏览器起不来/网络抖动/崩溃），不是可信的「未登录」结论
                 confident = proc.returncode == 0 and isinstance(d.get('loggedIn'), bool) and not d.get('error')
                 break
@@ -5459,6 +5547,863 @@ async def api_ideas_delete(iid: str):
         raise HTTPException(404, "选题不存在")
     _write_ideas(new)
     return {"ok": True, "deleted": iid}
+
+
+# --------------------------------------------------------------------------- #
+# 对标账号（benchmarks）：读**他人**公开账号，与「自有账号」严格分开
+# --------------------------------------------------------------------------- #
+# 存储约定与 _ideas/_schedule 一致：单文件列表 + 每账号一个目录。
+# 所有读取都走 skills/shared/scripts/benchmark_fetch.py 的平台适配器，
+# 后端不自己拼平台请求（新增平台只改适配器，Web 层不动）。
+BENCH_DIR = OUTPUTS_DIR / "_benchmarks"
+BENCH_ACCOUNTS_FILE = BENCH_DIR / "accounts.json"
+BENCH_FETCH_SCRIPT = SHARED_SCRIPTS / "benchmark_fetch.py"
+BENCH_FETCH_TIMEOUT = 300          # 单账号抓取上限（小红书 Steady 档约 30-60s）
+BENCH_COOLDOWN = 300               # 同一账号两次抓取最小间隔（秒）：读操作也会触发平台风控
+BENCH_DETAIL_MAX = 40              # 一次批量深挖上限（每条 = 一个 HTTP 请求）
+# 深挖之间的间隔：采用 XHS-Downloader（JoeanAmier）标定的对数正态分布，均值 6s、最小 1s。
+# 纯 HTTP 伪装指纹比浏览器稳得多，但读取节奏仍按成熟工具的取值来，不自己造更激进的参数。
+BENCH_DETAIL_AVG_GAP = 6.0
+BENCH_DETAIL_SIGMA = 0.6
+
+
+def _bench_detail_gap() -> float:
+    return max(1.0, random.lognormvariate(
+        math.log(BENCH_DETAIL_AVG_GAP) - (BENCH_DETAIL_SIGMA ** 2) / 2, BENCH_DETAIL_SIGMA))
+
+
+# ---- 平台 cookie：给纯 HTTP 取数用（用户从自己浏览器手动复制）----
+# 存在 outputs/_login/<platform>.cookie（outputs 已被 gitignore）；接口只回状态，不回 cookie 值。
+BENCH_COOKIE_PLATFORMS: dict[str, dict] = {
+    "xiaohongshu": {"name": "小红书", "required": ("web_session",),
+                    "note": "需要网页版登录后的 cookie：有了它才能拿到真实粉丝数与作品 ID，"
+                            "且完全不用浏览器（无头/弹窗都不需要）"},
+    "douyin": {"name": "抖音", "required": (), "note": "可选：抖音当前走浏览器取数"},
+    "tiktok": {"name": "TikTok", "required": (), "note": "可选：需要能访问 TikTok 的网络"},
+}
+
+
+def _bench_cookie_path(platform: str) -> Path:
+    if platform not in BENCH_COOKIE_PLATFORMS:
+        raise HTTPException(400, f"该平台不支持 cookie：{platform}")
+    return LOGIN_DIR / f"{platform}.cookie"
+
+
+def _bench_cookie_status(platform: str) -> dict:
+    fp = _bench_cookie_path(platform)
+    meta = BENCH_COOKIE_PLATFORMS[platform]
+    base = {"platform": platform, "name": meta["name"], "note": meta["note"],
+            "required": list(meta["required"])}
+    if not fp.is_file():
+        return {**base, "saved": False}
+    try:
+        raw = fp.read_text(encoding="utf-8").strip()
+    except OSError:
+        raw = ""
+    names = {p.split("=", 1)[0].strip() for p in raw.split(";") if "=" in p}
+    missing = [n for n in meta["required"] if n not in names]
+    return {**base, "saved": bool(raw), "cookie_count": len([p for p in raw.split(";") if "=" in p]),
+            "saved_at": int(fp.stat().st_mtime), "has_required": not missing, "missing": missing}
+
+
+def _bench_cookie_file(platform: str) -> str:
+    """有 cookie 就返回其路径（脚本据此走纯 HTTP），没有则空串。"""
+    fp = _bench_cookie_path(platform)
+    try:
+        return str(fp) if fp.is_file() and fp.read_text(encoding="utf-8").strip() else ""
+    except OSError:
+        return ""
+
+
+# ---- 单条笔记全量下载（图片 + 视频原片）----
+# 数据来源是**作品列表里已有的 note_id + xsec_token**，不需要用户粘贴链接。
+# 落到 outputs/_notes/<note_id>/（下划线开头 → 不进内容库，避免把他人素材混进自己的库）。
+NOTES_DIR = OUTPUTS_DIR / "_notes"
+XHS_NOTE_SCRIPT = SHARED_SCRIPTS / "xhs_note.py"
+XHS_SYNC_SCRIPT = SHARED_SCRIPTS / "xhs_sync.py"
+BENCH_NOTE_TASKS: dict[str, asyncio.Task] = {}
+# 刷新后自动同步：没下过的补素材、下过的只更新互动数据。
+# 上限是刻意的：50 条作品一次全下会拉 1-2GB，也容易把接口打到限流（实测 461）。
+BENCH_SYNC_MAX_DOWNLOADS = 10
+BENCH_SYNC_TIMEOUT = 3600          # 同步是长任务：每条间隔约 6s，50 条约 5-10 分钟
+
+
+def _note_load_index() -> dict:
+    """读 outputs/_notes/index.json：{笔记ID: 「作者/标题」相对目录}。"""
+    fp = NOTES_DIR / "index.json"
+    if not fp.is_file():
+        return {}
+    try:
+        data = json.loads(fp.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _note_rel_dir(note_id: str) -> str:
+    """笔记素材的相对目录；目录名现在是「作者/标题」，所以必须查索引而不是拼 ID。"""
+    rel = str(_note_load_index().get(note_id) or "")
+    return rel if rel and (NOTES_DIR / rel / "note.json").is_file() else ""
+
+
+def _note_summary(note_id: str) -> dict | None:
+    """已下载笔记的摘要（没有则 None）。"""
+    rel = _note_rel_dir(note_id)
+    if not rel:
+        return None
+    fp = NOTES_DIR / rel / "note.json"
+    try:
+        data = json.loads(fp.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return None
+    media = data.get("media") or []
+    ok = [m for m in media if not m.get("error")]
+    return {
+        "note_id": note_id,
+        "kind": data.get("kind") or "",
+        "title": data.get("title") or "",
+        "files": len(ok),
+        "bytes": sum(int(m.get("bytes") or 0) for m in ok),
+        "downloaded_at": data.get("downloaded_at"),
+        "dir": f"_notes/{rel}",
+        "note_md": f"_notes/{rel}/note.md",
+        "warnings": data.get("warnings") or [],
+    }
+
+
+async def _run_json_script(script: Path, args: list[str], timeout: int = 900) -> tuple[int, dict]:
+    """跑一个输出单行 JSON 的脚本（与 _bench_script 同约定，但可指定脚本）。"""
+    def _run():
+        proc = subprocess.run([sys.executable, str(script), *args], cwd=str(PROJECT_ROOT),
+                              env=_proxy_env(), capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=timeout)
+        payload: dict = {}
+        for line in reversed((proc.stdout or "").strip().splitlines()):
+            line = line.strip()
+            if line.startswith("{"):
+                try:
+                    payload = json.loads(line)
+                    break
+                except json.JSONDecodeError:
+                    continue
+        if not payload and proc.returncode != 0:
+            tail = (proc.stderr or proc.stdout or "").strip().splitlines()
+            payload = {"error": (tail[-1] if tail else f"退出码 {proc.returncode}")[:300]}
+        return proc.returncode, payload
+
+    return await asyncio.to_thread(_run)
+
+
+async def _bench_run_note_download(bid: str, work_id: str, note_id: str, token: str,
+                                   quality: str) -> None:
+    acc = next((a for a in _bench_read_accounts() if a.get("id") == bid), None) or {}
+    platform = acc.get("platform") or ""
+    _bench_write_status(bid, "running", f"正在下载笔记素材（{platform}）…")
+    # 目录由脚本按「作者/标题」决定（并写进 index.json），后端只给根目录
+    args = ["download", "--note-id", note_id, "--notes-dir", str(NOTES_DIR),
+            "--quality", quality, "-q"]
+    if token:
+        args += ["--xsec-token", token]
+    cookie_file = _bench_cookie_file(platform) if platform == "xiaohongshu" else ""
+    if cookie_file:
+        args += ["--cookie-file", cookie_file]
+    try:
+        code, res = await _run_json_script(XHS_NOTE_SCRIPT, args)
+        if code != 0 or res.get("error"):
+            _bench_write_status(bid, "error", str(res.get("error") or "下载失败")[:200])
+            return
+        ok = [m for m in (res.get("media") or []) if not m.get("error")]
+        mb = round(sum(int(m.get("bytes") or 0) for m in ok) / 1048576, 1)
+        warn = (res.get("warnings") or [])
+        _bench_write_status(bid, "done", f"已下载 {len(ok)} 个文件（{mb}MB）"
+                                         + (f"；{'；'.join(warn[:1])}" if warn else ""))
+    except Exception as error:  # noqa: BLE001
+        _bench_write_status(bid, "error", f"下载中断：{type(error).__name__}: {error}"[:200])
+    finally:
+        BENCH_NOTE_TASKS.pop(note_id, None)
+
+
+@app.post("/api/benchmarks/{bid}/works/{wid}/download")
+async def api_bench_work_download(bid: str, wid: str, quality: str = "lowest"):
+    """把这条作品的全部数据下下来（元数据 + 图片原图/动图 + 视频，**默认最低画质**）。
+
+    链接不用用户提供：作品列表里已经有 note_id 与 xsec_token。
+    """
+    acc = next((a for a in _bench_read_accounts() if a.get("id") == bid), None)
+    if acc is None:
+        raise HTTPException(404, "对标账号不存在")
+    platform = acc.get("platform") or ""
+    payload = _bench_read_works(bid)
+    work = next((w for w in (payload.get("works") or []) if str(w.get("id")) == wid), None)
+    if work is None:
+        raise HTTPException(404, "作品不存在")
+    if platform != "xiaohongshu":
+        raise HTTPException(400, "目前只有小红书支持整条笔记下载")
+    token = (work.get("extra") or {}).get("xsec_token") or ""
+    task = BENCH_NOTE_TASKS.get(wid)
+    if task and not task.done():
+        return {"state": "running", "message": "这条正在下载中", "reused": True}
+    BENCH_NOTE_TASKS[wid] = asyncio.create_task(
+        _bench_run_note_download(bid, wid, wid, token, quality))
+    return {"state": "running", "note_id": wid, "quality": quality,
+            "message": "开始下载（图片 + 视频），进度见状态"}
+
+
+BENCH_RUNNING: dict[str, asyncio.Task] = {}
+BENCH_LAST_START: dict[str, float] = {}
+_BENCH_PLATFORMS_CACHE: list[dict] = []
+BENCH_ALL_TASK: asyncio.Task | None = None
+
+
+def _bench_read_accounts() -> list[dict]:
+    if not BENCH_ACCOUNTS_FILE.is_file():
+        return []
+    try:
+        data = json.loads(BENCH_ACCOUNTS_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _bench_write_accounts(items: list[dict]) -> None:
+    BENCH_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = BENCH_ACCOUNTS_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, BENCH_ACCOUNTS_FILE)
+
+
+def _bench_account_dir(bid: str) -> Path:
+    if not re.fullmatch(r"[A-Za-z0-9_-]{4,32}", bid or ""):
+        raise HTTPException(400, "非法的账号 id")
+    return BENCH_DIR / bid
+
+
+def _bench_read_works(bid: str) -> dict:
+    fp = _bench_account_dir(bid) / "works.json"
+    if not fp.is_file():
+        return {}
+    try:
+        data = json.loads(fp.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _bench_write_json(fp: Path, payload) -> None:
+    fp.parent.mkdir(parents=True, exist_ok=True)
+    tmp = fp.with_suffix(fp.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, fp)
+
+
+def _bench_status_file(bid: str) -> Path:
+    return _bench_account_dir(bid) / "fetch.json"
+
+
+def _bench_write_status(bid: str, state: str, message: str = "") -> None:
+    """写异步抓取状态（与 _publish/login_state 同格式）。"""
+    _bench_write_json(_bench_status_file(bid),
+                      {"state": state, "message": message, "ts": int(time.time())})
+
+
+def _bench_read_status(bid: str) -> dict:
+    fp = _bench_status_file(bid)
+    if not fp.is_file():
+        return {"state": "idle", "message": "", "ts": 0}
+    try:
+        d = json.loads(fp.read_text(encoding="utf-8"))
+        return {"state": d.get("state", "idle"), "message": d.get("message", ""),
+                "ts": d.get("ts", 0)}
+    except Exception:
+        return {"state": "idle", "message": "", "ts": 0}
+
+
+def _bench_script(subcmd: list[str], timeout: int = 30) -> tuple[int, dict]:
+    """跑 benchmark_fetch.py 的一个子命令，取最后一行 JSON。"""
+    cmd = [sys.executable, str(BENCH_FETCH_SCRIPT), *subcmd]
+    env = _proxy_env()
+    env.update(PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
+    try:
+        proc = subprocess.run(cmd, cwd=str(PROJECT_ROOT), env=env,
+                              capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return 3, {"error": f"超时（>{timeout}s）"}
+    for line in reversed((proc.stdout or "").strip().splitlines()):
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                payload = json.loads(line)
+            except Exception:
+                continue
+            if isinstance(payload, dict):
+                return proc.returncode, payload
+    detail = (proc.stderr or "").strip().splitlines()[-1:] or ["无输出"]
+    return proc.returncode, {"error": detail[0][:200]}
+
+
+def _bench_platforms(refresh: bool = False) -> list[dict]:
+    """平台能力矩阵（进程内缓存；适配器是注册表，运行时不会变）。"""
+    global _BENCH_PLATFORMS_CACHE
+    if _BENCH_PLATFORMS_CACHE and not refresh:
+        return _BENCH_PLATFORMS_CACHE
+    code, payload = _bench_script(["platforms"], timeout=30)
+    plats = payload.get("platforms") if code == 0 else None
+    if isinstance(plats, list) and plats:
+        _BENCH_PLATFORMS_CACHE = plats
+    return _BENCH_PLATFORMS_CACHE
+
+
+def _bench_platform_meta(platform: str) -> dict:
+    for p in _bench_platforms():
+        if p.get("platform") == platform:
+            return p
+    return {}
+
+
+def _bench_cooldown_left(bid: str) -> int:
+    started = BENCH_LAST_START.get(bid, 0)
+    left = int(BENCH_COOLDOWN - (time.time() - started))
+    return max(0, left)
+
+
+def _bench_fetch_one(bid: str) -> dict:
+    """同步抓一个账号并落盘（在线程里跑）。返回更新后的账号记录。"""
+    accounts = _bench_read_accounts()
+    acc = next((a for a in accounts if a.get("id") == bid), None)
+    if acc is None:
+        raise RuntimeError("账号不存在")
+    adir = _bench_account_dir(bid)
+    covers = adir / "covers"
+    covers.mkdir(parents=True, exist_ok=True)
+    platform = acc.get("platform", "")
+    meta = _bench_platform_meta(platform)
+    # 小红书：主页 SSR 一次 30 条，多的走签名分页；约定最多取最新 50 条
+    limit = "50" if platform == "xiaohongshu" else "20"
+
+    fetch_cmd = ["fetch", "--platform", platform, "--target", acc.get("account_id", ""),
+                 "--limit", limit, "--cover-dir", str(covers), "-q"]
+    cookie_file = _bench_cookie_file(platform)
+    if cookie_file:
+        fetch_cmd += ["--cookie-file", cookie_file]      # 小红书：有 cookie 就纯 HTTP，不起浏览器
+    code, payload = _bench_script(fetch_cmd, timeout=BENCH_FETCH_TIMEOUT)
+
+    now = int(time.time())
+    if code == 2 or payload.get("risk"):
+        acc["last_error"] = f"平台风控熔断：{payload.get('risk') or payload.get('error') or '命中风控信号'}；已停止，请数小时后再试"
+        acc["status"] = "risk"
+    elif payload.get("unsupported"):
+        acc["last_error"] = str(payload.get("error") or "该平台暂不支持自动抓取")
+        acc["status"] = "unsupported"
+    elif code != 0 or payload.get("error"):
+        acc["last_error"] = str(payload.get("error") or "抓取失败")[:240]
+        acc["status"] = "error"
+    else:
+        works = payload.get("works") or []
+        # 会话降级保护：本次被判游客态（cookie 失效/被平台降级）时，拿回的作品**没有 ID**；
+        # 若直接覆盖，会把上次登录态抓到的、能深挖能跳原文的那批数据毁掉。
+        # 所以保留上次的作品列表，只更新账号级指标，并明确告警（不静默降级）。
+        old_works = (_bench_read_works(bid).get("works") or [])
+        if (payload.get("logged_in") is False and old_works
+                and any(w.get("id") for w in old_works)
+                and not any(w.get("id") for w in works)):
+            works = old_works
+            acc["degraded"] = True
+            payload.setdefault("warnings", []).append(
+                f"本次被判游客态，已保留上次抓到的 {len(old_works)} 条作品（含作品 ID）；"
+                "cookie 恢复后点刷新即可拿到最新列表")
+        else:
+            acc.pop("degraded", None)
+        # 深挖来的作品级数据要能跨刷新存活：刷新时整批替换 works 列表，
+        # 若不做合并，用户辛苦逐条读出来的收藏/评论会在下一次刷新时被抹掉（实测踩到）。
+        # 规则：同一条作品（按 id 对齐）里，本次没抓到的字段沿用上次深挖的值。
+        old_by_id = {str(w.get("id")): w for w in (_bench_read_works(bid).get("works") or [])
+                     if w.get("id")}
+        kept = 0
+        for w in works:
+            src = old_by_id.get(str(w.get("id")))
+            if not src:
+                continue
+            for key in ("favorites", "comments", "shares"):
+                if w.get(key) is None and src.get(key) is not None:
+                    w[key] = src[key]
+            if src.get("detail_fetched") and any(
+                    w.get(k) is not None for k in ("favorites", "comments")):
+                w["detail_fetched"] = True
+                kept += 1
+        for w in works:
+            # 封面本地路径 → 前端可用的 outputs 相对路径（下载失败则回退远程 URL）
+            name = w.get("cover") or ""
+            w["cover_path"] = f"_benchmarks/{bid}/covers/{name}" if name else ""
+        acc.update({
+            "nickname": payload.get("nickname") or acc.get("nickname") or "",
+            "avatar": payload.get("avatar") or acc.get("avatar") or "",
+            "bio": payload.get("bio") or acc.get("bio") or "",
+            "home_url": payload.get("home_url") or acc.get("home_url") or "",
+            "followers": payload.get("followers"),
+            "likes": payload.get("likes"),
+            "favorites": payload.get("favorites"),
+            "comments": payload.get("comments"),
+            "posts": payload.get("posts"),
+            "coverage": payload.get("coverage") or "",
+            "source": payload.get("source") or "",
+            "warnings": payload.get("warnings") or [],
+            "logged_in": payload.get("logged_in", True),
+            "median_likes": payload.get("median_likes"),
+            "work_count": len(works),
+            "detail_work_count": kept,
+            "fetched_at": payload.get("fetched_at") or now,
+            "last_error": "",
+            "status": "ok",
+        })
+        _bench_write_json(adir / "works.json", {
+            "platform": platform, "account_id": acc.get("account_id"),
+            "fetched_at": acc["fetched_at"], "coverage": acc["coverage"],
+            "source": acc["source"], "median_likes": acc.get("median_likes"),
+            "warnings": acc.get("warnings") or [], "works": works,
+        })
+        with (adir / "history.jsonl").open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({
+                "ts": acc["fetched_at"],
+                "followers": (payload.get("followers") or {}).get("num"),
+                "likes": (payload.get("likes") or {}).get("num"),
+                "work_count": len(works),
+                "median_likes": payload.get("median_likes"),
+            }, ensure_ascii=False) + "\n")
+    acc["platform_name"] = payload.get("platform_name") or meta.get("name") or platform
+    _bench_write_accounts(accounts)
+    return acc
+
+
+async def _bench_run_sync(bid: str, platform: str, *, max_downloads: int) -> dict:
+    """刷新后的「同步」：没下过的补素材，下过的只更新互动数据。
+
+    进度直接写进**同一個状态文件**（UI 本来就在轮询它），所以前端不用改就能看到
+    「同步 7/50：已更新互动数据」这类进度。
+    """
+    acc = next((a for a in _bench_read_accounts() if a.get("id") == bid), None) or {}
+    args = ["--works-file", str(_bench_account_dir(bid) / "works.json"),
+            "--notes-dir", str(NOTES_DIR),
+            "--progress-file", str(_bench_account_dir(bid) / "fetch.json"),
+            "--max-downloads", str(max_downloads), "-q"]
+    cookie_file = _bench_cookie_file(platform)
+    if cookie_file:
+        args += ["--cookie-file", cookie_file]
+    code, res = await _run_json_script(XHS_SYNC_SCRIPT, args, timeout=BENCH_SYNC_TIMEOUT)
+    if code != 0 or res.get("error"):
+        return {"error": str(res.get("error") or "同步失败")[:200]}
+    return res
+
+
+async def _bench_run_fetch(bid: str, *, sync: bool = True, max_downloads: int | None = None) -> None:
+    _bench_write_status(bid, "running", "正在抓取公开主页…")
+    try:
+        acc = await asyncio.to_thread(_bench_fetch_one, bid)
+        if acc.get("status") == "ok":
+            msg = f"完成：{acc.get('work_count', 0)} 条作品"
+            if acc.get("coverage"):
+                msg += f"（{acc['coverage']}）"
+            _bench_write_status(bid, "done", msg)
+        elif acc.get("status") == "risk":
+            _bench_write_status(bid, "risk", acc.get("last_error", ""))
+        else:
+            _bench_write_status(bid, "error", acc.get("last_error", "抓取失败"))
+            return
+        # 小红书：刷新后接着同步本地素材库（新作品下素材 / 老作品更新互动数据）
+        platform = acc.get("platform") or ""
+        if sync and platform == "xiaohongshu" and acc.get("status") == "ok":
+            budget = BENCH_SYNC_MAX_DOWNLOADS if max_downloads is None else max(0, max_downloads)
+            stats = await _bench_run_sync(bid, platform, max_downloads=budget)
+            if stats.get("error"):
+                _bench_write_status(bid, "error", f"同步失败：{stats['error']}")
+            elif stats.get("total"):
+                tail = (f"，素材 {stats.get('downloaded_files', 0)} 个"
+                        f"（{round(int(stats.get('downloaded_bytes') or 0) / 1048576, 1)}MB）")
+                msg = (f"{msg} · 同步：更新 {stats.get('updated', 0)} 条{tail}"
+                       + (f"，失败 {stats['failed']} 条" if stats.get("failed") else ""))
+                if stats.get("skipped_due_budget"):
+                    msg += f"；还有 {stats['skipped_due_budget']} 条未下载（本次预算 {budget} 条）"
+                _bench_write_status(bid, "done", msg)
+    except Exception as e:  # noqa: BLE001
+        _bench_write_status(bid, "error", f"{type(e).__name__}: {e}"[:200])
+    finally:
+        BENCH_RUNNING.pop(bid, None)
+
+
+class BenchmarkItem(BaseModel):
+    platform: str
+    target: str = ""      # 账号 ID 或主页链接
+    remark: str = ""
+    tags: list[str] = []
+
+
+@app.get("/api/benchmarks/cookies")
+async def api_bench_cookies():
+    """各平台 cookie 状态（只回长度/是否含必需项，**绝不回 cookie 值**）。"""
+    return [_bench_cookie_status(p) for p in BENCH_COOKIE_PLATFORMS]
+
+
+class BenchCookie(BaseModel):
+    cookie: str = ""
+
+
+@app.post("/api/benchmarks/cookies/{platform}")
+async def api_bench_cookie_save(platform: str, req: BenchCookie):
+    """保存用户从浏览器手动复制的 cookie（写入 outputs/_login/<platform>.cookie）。"""
+    fp = _bench_cookie_path(platform)
+    raw = (req.cookie or "").strip()
+    if not raw:
+        raise HTTPException(400, "cookie 是空的")
+    if len(raw) > 20000:
+        raise HTTPException(400, "cookie 过长，请确认复制的是请求头里的 Cookie 值")
+    names = {p.split("=", 1)[0].strip() for p in raw.split(";") if "=" in p}
+    missing = [n for n in BENCH_COOKIE_PLATFORMS[platform]["required"] if n not in names]
+    if missing:
+        raise HTTPException(400, f"这份 cookie 里缺少 {'、'.join(missing)}——"
+                                 "请确认是在**已登录**的小红书网页里复制的")
+    fp.parent.mkdir(parents=True, exist_ok=True)
+    tmp = fp.with_suffix(".cookie.tmp")
+    tmp.write_text(raw, encoding="utf-8")
+    os.replace(tmp, fp)
+    return _bench_cookie_status(platform)
+
+
+@app.delete("/api/benchmarks/cookies/{platform}")
+async def api_bench_cookie_clear(platform: str):
+    fp = _bench_cookie_path(platform)
+    if fp.is_file():
+        fp.unlink()
+    return _bench_cookie_status(platform)
+
+
+@app.get("/api/benchmarks/platforms")
+async def api_bench_platforms():
+    """平台能力矩阵：哪些平台能自动抓、能拿到哪些字段、抓一次什么代价。"""
+    return {"platforms": await asyncio.to_thread(_bench_platforms)}
+
+
+@app.get("/api/benchmarks")
+async def api_bench_list():
+    """对标账号列表（读本地快照，绝不在这里触发抓取）。"""
+    accounts = _bench_read_accounts()
+    out = []
+    for a in accounts:
+        item = dict(a)
+        item["fetch"] = _bench_read_status(a.get("id", ""))
+        item["cooldown_left"] = _bench_cooldown_left(a.get("id", ""))
+        item["running"] = a.get("id") in BENCH_RUNNING
+        out.append(item)
+    return out
+
+
+@app.post("/api/benchmarks")
+async def api_bench_create(req: BenchmarkItem):
+    platform = (req.platform or "").strip()
+    meta = _bench_platform_meta(platform)
+    if not meta:
+        raise HTTPException(400, f"未知平台：{platform or '(空)'}")
+    if not (req.target or "").strip():
+        raise HTTPException(400, "请填写账号 ID 或主页链接")
+    code, payload = await asyncio.to_thread(
+        _bench_script, ["parse", "--platform", platform, "--target", req.target.strip()], 30)
+    if code != 0 or payload.get("error"):
+        raise HTTPException(400, str(payload.get("error") or "账号 ID 无法解析")[:200])
+    target = payload.get("target") or req.target.strip()
+    accounts = _bench_read_accounts()
+    dup = next((a for a in accounts
+                if a.get("platform") == platform and a.get("account_id") == target), None)
+    if dup:
+        raise HTTPException(409, f"该账号已在列表中：{dup.get('nickname') or target}")
+    item = {
+        "id": uuid.uuid4().hex[:12],
+        "platform": platform,
+        "platform_name": meta.get("name") or platform,
+        "account_id": target,
+        "home_url": "",
+        "nickname": "",
+        "avatar": "",
+        "bio": "",
+        "remark": (req.remark or "").strip(),
+        "tags": [t.strip() for t in (req.tags or []) if str(t).strip()][:8],
+        "followers": None, "likes": None, "favorites": None, "comments": None,
+        "posts": None, "coverage": "", "source": "", "warnings": [],
+        "logged_in": True,
+        "median_likes": None, "work_count": 0,
+        "created": int(time.time()), "fetched_at": 0, "last_error": "",
+        "status": "new" if meta.get("auto") else "manual",
+    }
+    accounts.insert(0, item)
+    _bench_write_accounts(accounts)
+    return item
+
+
+@app.delete("/api/benchmarks/{bid}")
+async def api_bench_delete(bid: str):
+    adir = _bench_account_dir(bid)
+    accounts = _bench_read_accounts()
+    kept = [a for a in accounts if a.get("id") != bid]
+    if len(kept) == len(accounts):
+        raise HTTPException(404, "对标账号不存在")
+    task = BENCH_RUNNING.get(bid)
+    if task and not task.done():
+        task.cancel()
+    _bench_write_accounts(kept)
+    if adir.is_dir():
+        shutil.rmtree(adir, ignore_errors=True)
+    return {"ok": True, "deleted": bid}
+
+
+@app.get("/api/benchmarks/{bid}")
+async def api_bench_detail(bid: str):
+    accounts = _bench_read_accounts()
+    acc = next((a for a in accounts if a.get("id") == bid), None)
+    if acc is None:
+        raise HTTPException(404, "对标账号不存在")
+    works = _bench_read_works(bid)
+    rows = works.get("works") or []
+    if acc.get("platform") == "xiaohongshu":
+        # 每条的下载状态（有没有下过、下了多少文件），供作品卡显示按钮状态
+        for w in rows:
+            summary = _note_summary(str(w.get("id") or "")) if w.get("id") else None
+            w["downloaded"] = bool(summary)
+            if summary:
+                w["download"] = summary
+            elif BENCH_NOTE_TASKS.get(str(w.get("id") or "")):
+                task = BENCH_NOTE_TASKS.get(str(w.get("id") or ""))
+                w["downloading"] = bool(task and not task.done())
+    return {
+        "account": acc,
+        "platform": _bench_platform_meta(acc.get("platform", "")),
+        "works": rows,
+        "coverage": works.get("coverage") or acc.get("coverage") or "",
+        "source": works.get("source") or acc.get("source") or "",
+        "fetched_at": works.get("fetched_at") or acc.get("fetched_at") or 0,
+        "median_likes": works.get("median_likes") if works else acc.get("median_likes"),
+        "fetch": _bench_read_status(bid),
+        "cooldown_left": _bench_cooldown_left(bid),
+        "cooldown": BENCH_COOLDOWN,
+    }
+
+
+@app.post("/api/benchmarks/{bid}/fetch")
+async def api_bench_fetch(bid: str, sync: bool = True, max_downloads: int | None = None):
+    """触发一次抓取（异步）。同一账号并发只跑一个；冷却期内直接拒绝。
+
+    小红书默认接着做**同步**：没下过的补素材、下过的只更新互动数据。
+    ``max_downloads`` 限制本次最多下载几条新作品（默认 10，0 = 只更新数据）。
+    """
+    accounts = _bench_read_accounts()
+    acc = next((a for a in accounts if a.get("id") == bid), None)
+    if acc is None:
+        raise HTTPException(404, "对标账号不存在")
+    meta = _bench_platform_meta(acc.get("platform", ""))
+    if not meta.get("auto"):
+        raise HTTPException(400, f"{meta.get('name') or acc.get('platform')}暂不支持自动抓取"
+                                 + (f"：{meta.get('note')}" if meta.get("note") else ""))
+    task = BENCH_RUNNING.get(bid)
+    if task and not task.done():
+        return {"state": "running", "message": "已有一个抓取在进行中", "reused": True}
+    left = _bench_cooldown_left(bid)
+    if left > 0:
+        raise HTTPException(429, f"刚抓过：请等 {left} 秒再试（读操作也会触发平台风控）")
+    BENCH_LAST_START[bid] = time.time()
+    task = asyncio.create_task(_bench_run_fetch(bid, sync=sync, max_downloads=max_downloads))
+    BENCH_RUNNING[bid] = task
+    return {"state": "running", "message": "已开始抓取" + ("（含同步素材）" if sync else "")}
+
+
+@app.get("/api/benchmarks/{bid}/fetch/status")
+async def api_bench_fetch_status(bid: str):
+    accounts = _bench_read_accounts()
+    if not any(a.get("id") == bid for a in accounts):
+        raise HTTPException(404, "对标账号不存在")
+    st = _bench_read_status(bid)
+    return {**st, "running": bid in BENCH_RUNNING,
+            "cooldown_left": _bench_cooldown_left(bid)}
+
+
+@app.post("/api/benchmarks/fetch-all")
+async def api_bench_fetch_all():
+    """串行刷新全部可自动抓取的账号（绝不并发——平台风控会因并发读降级账号）。"""
+    global BENCH_ALL_TASK
+    if BENCH_ALL_TASK and not BENCH_ALL_TASK.done():
+        return {"state": "running", "message": "批量刷新已在进行中", "reused": True}
+    accounts = [a for a in _bench_read_accounts()
+                if _bench_platform_meta(a.get("platform", "")).get("auto")]
+    if not accounts:
+        raise HTTPException(400, "没有可自动抓取的对标账号")
+
+    async def _run_all():
+        for a in accounts:
+            bid = a.get("id", "")
+            if not bid or BENCH_RUNNING.get(bid):
+                continue
+            BENCH_LAST_START[bid] = time.time()
+            task = asyncio.create_task(_bench_run_fetch(bid))
+            BENCH_RUNNING[bid] = task
+            try:
+                await task
+            except Exception:  # noqa: BLE001
+                pass
+            await asyncio.sleep(2)   # 账号之间留间隔，避免连打
+
+    BENCH_ALL_TASK = asyncio.create_task(_run_all())
+    return {"state": "running", "total": len(accounts)}
+
+
+@app.get("/api/benchmarks/fetch-all/status")
+async def api_bench_fetch_all_status():
+    done, total = 0, 0
+    states = {}
+    for a in _bench_read_accounts():
+        bid = a.get("id", "")
+        if not _bench_platform_meta(a.get("platform", "")).get("auto"):
+            continue
+        total += 1
+        st = _bench_read_status(bid)
+        states[bid] = st.get("state")
+        if st.get("state") in ("done", "error", "risk"):
+            done += 1
+    return {"running": bool(BENCH_ALL_TASK and not BENCH_ALL_TASK.done()),
+            "done": done, "total": total, "states": states}
+
+
+# --------------------------------------------------------------------------- #
+# 批量深挖：作品的收藏/评论不在主页列表里，要逐条打开作品页读（每条一次页面加载）
+# --------------------------------------------------------------------------- #
+def _bench_pending_detail(works: list[dict]) -> list[dict]:
+    """还没真正拿到收藏/评论的作品。
+
+    判定不能只看 ``detail_fetched``：早先版本在「没读到数据」时也标了完成（已修），
+    那些残留标记会让作品永远不再被深挖——所以这里以「有没有数据」为准，自愈。
+    """
+    return [w for w in works if w.get("id") and not (
+        w.get("detail_fetched")
+        and (w.get("favorites") is not None or w.get("comments") is not None))]
+
+
+async def _bench_run_detail_batch(bid: str, limit: int) -> None:
+    payload = _bench_read_works(bid)
+    works = payload.get("works") or []
+    targets = _bench_pending_detail(works)[:limit]
+    if not targets:
+        _bench_write_status(bid, "done", "这批作品的收藏/评论都已补齐")
+        return
+    accounts = _bench_read_accounts()
+    acc = next((a for a in accounts if a.get("id") == bid), None) or {}
+    platform = acc.get("platform", "")
+    _bench_write_status(bid, "running", f"正在逐条读取收藏/评论 0/{len(targets)}…")
+    done = 0
+    try:
+        for w in targets:
+            token = (w.get("extra") or {}).get("xsec_token") or ""
+            if not token:
+                w["detail_error"] = "缺少定位信息（平台未返回 xsec_token）"
+                done += 1
+                continue
+            code, res = await asyncio.to_thread(
+                _bench_script,
+                ["detail", "--platform", platform, "--target", acc.get("account_id", ""),
+                 "--work-id", str(w.get("id")), "--xsec-token", token, "-q"]
+                + (["--cookie-file", cf] if (cf := _bench_cookie_file(platform)) else []),
+                BENCH_FETCH_TIMEOUT)
+            err = str(res.get("error") or "")
+            if code != 0 or err:
+                # 命中风控立刻停手，不重试（重试会把软限流升级成数小时封禁）
+                if "风控" in err or "300012" in err or "风险" in err:
+                    _bench_write_json(_bench_account_dir(bid) / "works.json", payload)
+                    _bench_write_status(
+                        bid, "risk",
+                        f"深挖中途被平台风控拦住（已完成 {done}/{len(targets)} 条）：{err[:140]}")
+                    return
+                w["detail_error"] = err[:140]        # 单条失败不拖垮整批（可能笔记已删除）
+            else:
+                for key in ("likes", "favorites", "comments", "shares"):
+                    if res.get(key) is not None:
+                        w[key] = res[key]
+                w["detail_fetched"] = True
+            done += 1
+            _bench_write_json(_bench_account_dir(bid) / "works.json", payload)   # 渐进落盘
+            _bench_write_status(bid, "running", f"正在逐条读取收藏/评论 {done}/{len(targets)}…")
+            await asyncio.sleep(_bench_detail_gap())
+        _bench_write_status(bid, "done", f"收藏/评论已补齐 {done} 条")
+    except Exception as e:  # noqa: BLE001
+        _bench_write_status(bid, "error", f"批量深挖中断：{type(e).__name__}: {e}"[:180])
+    finally:
+        BENCH_RUNNING.pop(bid, None)
+
+
+@app.post("/api/benchmarks/{bid}/works/detail-batch")
+async def api_bench_works_detail_batch(bid: str, limit: int = 0):
+    """把还没深挖过的作品逐条补上收藏/评论（串行 + 间隔，风控即停）。
+
+    不做进「刷新」的默认流程：那等于每次刷新连打十几次页面加载，最容易招风控。
+    ``limit=0``（默认）表示「把待补的全部补完」，上限 ``BENCH_DETAIL_MAX`` 条。
+    已完成的部分逐条落盘，中途停止/关页面都不会丢。
+    """
+    accounts = _bench_read_accounts()
+    acc = next((a for a in accounts if a.get("id") == bid), None)
+    if acc is None:
+        raise HTTPException(404, "对标账号不存在")
+    task = BENCH_RUNNING.get(bid)
+    if task and not task.done():
+        return {"state": "running", "message": "已有任务在进行中", "reused": True}
+    meta = _bench_platform_meta(acc.get("platform", ""))
+    fields = meta.get("fields") or {}
+    if not fields.get("work_detail_manual"):
+        # 抖音/TikTok 的收藏/评论随列表一起返回，不需要也不该逐条再打一次页面
+        raise HTTPException(400, f"{meta.get('name') or acc.get('platform')}的收藏/评论随列表返回，"
+                                 "不需要逐条深挖")
+    payload = _bench_read_works(bid)
+    pending = _bench_pending_detail(payload.get("works") or [])
+    if not pending:
+        return {"state": "done", "message": "这批作品的收藏/评论都已补齐", "total": 0}
+    want = int(limit or 0) or len(pending)          # 0 = 把待补的全部补完
+    limit = max(1, min(want, BENCH_DETAIL_MAX))
+    total = min(len(pending), limit)
+    BENCH_RUNNING[bid] = asyncio.create_task(_bench_run_detail_batch(bid, limit))
+    return {"state": "running", "total": total, "pending": len(pending),
+            "message": f"开始逐条读取 {total} 条作品的收藏/评论"}
+
+
+@app.post("/api/benchmarks/{bid}/works/{wid}/detail")
+async def api_bench_work_detail(bid: str, wid: str):
+    """按需深挖单条作品（收藏/评论）。平台不给作品 ID 时明确拒绝，不做无意义的等待。"""
+    accounts = _bench_read_accounts()
+    acc = next((a for a in accounts if a.get("id") == bid), None)
+    if acc is None:
+        raise HTTPException(404, "对标账号不存在")
+    if not (wid or "").strip():
+        raise HTTPException(400, "缺少作品 ID：该平台未返回作品 ID，无法深挖")
+    payload = _bench_read_works(bid)
+    works = payload.get("works") or []
+    work = next((w for w in works if str(w.get("id")) == wid), None)
+    if work is None:
+        raise HTTPException(404, "作品不存在（或平台未返回作品 ID，无法定位）")
+    token = (work.get("extra") or {}).get("xsec_token") or ""
+    if not token:
+        raise HTTPException(400, "该作品缺少定位信息（平台未返回），无法深挖")
+    code, res = await asyncio.to_thread(
+        _bench_script,
+        ["detail", "--platform", acc.get("platform", ""), "--target", acc.get("account_id", ""),
+         "--work-id", wid, "--xsec-token", token, "-q"]
+        + (["--cookie-file", cf] if (cf := _bench_cookie_file(acc.get("platform", ""))) else []),
+        BENCH_FETCH_TIMEOUT)
+    if code != 0 or res.get("error"):
+        raise HTTPException(502, str(res.get("error") or "深挖失败")[:240])
+    got = any(res.get(k) is not None for k in ("likes", "favorites", "comments"))
+    if got:
+        for key in ("likes", "favorites", "comments", "shares"):
+            if res.get(key) is not None:
+                work[key] = res[key]
+        work["detail_fetched"] = True
+        work.pop("detail_error", None)
+    else:
+        # 没读到数据就不能标记完成：否则它会一直占着「已深挖」的位置，
+        # 之后既不会被批量深挖重试，界面上也看不出问题（实测踩到过）。
+        work["detail_error"] = ((res.get("extra") or {}).get("detail_note")
+                                or "没读到互动数据（笔记可能已删除或页面改版）")
+    _bench_write_json(_bench_account_dir(bid) / "works.json", payload)
+    return work
 
 
 if __name__ == "__main__":

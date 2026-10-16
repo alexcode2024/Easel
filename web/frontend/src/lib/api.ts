@@ -473,6 +473,25 @@ export interface AccountWhoami {
   avatar: string;   // 头像 URL（http）或空
 }
 
+/** 小红书会话健康：主站（读数据）与创作平台（发布）是两套独立会话。 */
+export interface AccountSession {
+  platform: string;
+  cookie: BenchCookieStatus | null;
+  web: { ok: boolean; detail: string; nickname?: string; user_id?: string } | null;
+  creator: { cookie_present: boolean; detail: string } | null;
+  logged_in?: boolean;
+  checked_at?: number;
+  name?: string;
+  hint?: string;
+  error?: string;
+}
+
+/** 查会话健康；check=1 会用 cookie 走一次纯 HTTP 校验（约 1 秒，不起浏览器）。 */
+export function accountSession(platform: string, check = false): Promise<AccountSession> {
+  return request<AccountSession>(
+    `/api/accounts/${encodeURIComponent(platform)}/session${check ? '?check=1' : ''}`);
+}
+
 /** 真校验某平台登录态 + 拉昵称/头像（后端起 headless 浏览器，数秒）。 */
 export function accountWhoami(platform: string, force = false): Promise<AccountWhoami> {
   return request<AccountWhoami>(`/api/accounts/${encodeURIComponent(platform)}/whoami${force ? '?force=true' : ''}`);
@@ -575,6 +594,233 @@ export function submitLoginSms(platform: string, code: string): Promise<{ ok: bo
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ code }),
   });
+}
+
+// ---- 对标账号（他人公开账号，与「自有账号」分开） ----
+/** 一个指标：平台原始展示串 + 解析值 + 是否只是量级下界。 */
+export interface BenchMetric {
+  raw: string;
+  num: number | null;
+  lower_bound: boolean;
+}
+
+/** 平台适配器能力声明：决定哪些字段「本来就没有」而不是「这次没取到」。 */
+export interface BenchPlatformFields {
+  followers?: boolean;
+  likes?: boolean;
+  favorites?: boolean;
+  comments?: boolean;
+  posts?: boolean;
+  cover?: boolean;
+  work_likes?: boolean;
+  work_favorites?: boolean;
+  work_comments?: boolean;
+  work_published_at?: boolean;
+}
+
+export interface BenchPlatform {
+  platform: string;
+  name: string;
+  auto: boolean;
+  experimental: boolean;
+  id_label: string;
+  id_hint: string;
+  fields: BenchPlatformFields;
+  note: string;
+}
+
+export interface BenchWork {
+  id: string;
+  title: string;
+  url: string;
+  cover_url: string;
+  cover: string;
+  cover_path: string;
+  published_at_ms: number | null;
+  likes: number | null;
+  likes_raw: string;
+  favorites: number | null;
+  comments: number | null;
+  shares: number | null;
+  plays: number | null;
+  is_top: boolean;
+  is_burst: boolean;
+  median_likes: number | null;
+  detail_fetched: boolean;
+  detail_available: boolean;
+  extra?: Record<string, unknown>;
+  /** 该条笔记是否已下载过（图片原图/动图 + 视频 + 元数据记录）。 */
+  downloaded?: boolean;
+  downloading?: boolean;
+  download?: BenchWorkDownload;
+}
+
+export interface BenchStatus {
+  state: string;
+  message: string;
+  ts: number;
+  running?: boolean;
+  cooldown_left?: number;
+}
+
+export interface BenchAccount {
+  id: string;
+  platform: string;
+  platform_name: string;
+  account_id: string;
+  home_url: string;
+  nickname: string;
+  avatar: string;
+  bio: string;
+  remark: string;
+  tags: string[];
+  followers: BenchMetric | null;
+  likes: BenchMetric | null;
+  favorites: BenchMetric | null;
+  comments: BenchMetric | null;
+  posts: number | null;
+  coverage: string;
+  source: string;
+  warnings: string[];
+  logged_in?: boolean;
+  /** 本次抓取被判游客态（cookie 失效/降级）且已保留上次作品列表时置真。 */
+  degraded?: boolean;
+  median_likes: number | null;
+  work_count: number;
+  created: number;
+  fetched_at: number;
+  last_error: string;
+  status: string;
+  fetch?: BenchStatus;
+  cooldown_left?: number;
+  running?: boolean;
+}
+
+export interface BenchDetail {
+  account: BenchAccount;
+  platform: BenchPlatform | Record<string, never>;
+  works: BenchWork[];
+  coverage: string;
+  source: string;
+  fetched_at: number;
+  median_likes: number | null;
+  fetch: BenchStatus;
+  cooldown_left: number;
+  cooldown: number;
+}
+
+/** 单条笔记的下载结果摘要（文件数/体积/记录文件）。 */
+export interface BenchWorkDownload {
+  note_id: string;
+  kind: string;
+  files: number;
+  bytes: number;
+  downloaded_at?: number;
+  dir: string;
+  note_md: string;
+  warnings: string[];
+}
+
+/** 下载这条作品的全部数据（元数据 + 图片原图/动图 + 视频，默认 1080p）。 */
+export function downloadBenchWork(bid: string, wid: string, quality = '1080'): Promise<{
+  state: string; note_id?: string; message?: string; reused?: boolean;
+}> {
+  return request(`/api/benchmarks/${encodeURIComponent(bid)}/works/${encodeURIComponent(wid)}`
+    + `/download?quality=${quality}`, { method: 'POST' });
+}
+
+/** 平台 cookie 状态（只回长度/是否含必需项，不回 cookie 值）。 */
+export interface BenchCookieStatus {
+  platform: string;
+  name: string;
+  saved: boolean;
+  note: string;
+  required: string[];
+  cookie_count?: number;
+  saved_at?: number;
+  has_required?: boolean;
+  missing?: string[];
+}
+
+export function fetchBenchCookies(): Promise<BenchCookieStatus[]> {
+  return request('/api/benchmarks/cookies');
+}
+
+/** 保存从浏览器手动复制的 cookie（小红书等平台纯 HTTP 取数用）。 */
+export function saveBenchCookie(platform: string, cookie: string): Promise<BenchCookieStatus> {
+  return request(`/api/benchmarks/cookies/${encodeURIComponent(platform)}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ cookie }),
+  });
+}
+
+export function clearBenchCookie(platform: string): Promise<BenchCookieStatus> {
+  return request(`/api/benchmarks/cookies/${encodeURIComponent(platform)}`, { method: 'DELETE' });
+}
+
+/** 平台能力矩阵（哪些平台能自动抓、能拿到哪些字段）。 */
+export function fetchBenchPlatforms(): Promise<{ platforms: BenchPlatform[] }> {
+  return request('/api/benchmarks/platforms');
+}
+
+export function fetchBenchmarks(): Promise<BenchAccount[]> {
+  return request('/api/benchmarks');
+}
+
+export function fetchBenchmark(id: string): Promise<BenchDetail> {
+  return request(`/api/benchmarks/${encodeURIComponent(id)}`);
+}
+
+export function createBenchmark(item: {
+  platform: string; target: string; remark?: string; tags?: string[];
+}): Promise<BenchAccount> {
+  return request('/api/benchmarks', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(item),
+  });
+}
+
+export function deleteBenchmark(id: string): Promise<{ ok: boolean; deleted: string }> {
+  return request(`/api/benchmarks/${encodeURIComponent(id)}`, { method: 'DELETE' });
+}
+
+/** 触发一次抓取（异步；抓一次 30s～几分钟，随后轮询 status）。
+ *  小红书会顺带同步素材：maxDownloads = 本次最多补下几条新作品（0 = 只更新数据不下素材）。 */
+export function fetchBenchmarkNow(id: string, maxDownloads?: number): Promise<BenchStatus> {
+  const q = maxDownloads === undefined ? '' : `?max_downloads=${maxDownloads}`;
+  return request(`/api/benchmarks/${encodeURIComponent(id)}/fetch${q}`, { method: 'POST' });
+}
+
+export function benchmarkFetchStatus(id: string): Promise<BenchStatus> {
+  return request(`/api/benchmarks/${encodeURIComponent(id)}/fetch/status`);
+}
+
+/** 串行刷新全部可自动抓取的账号。 */
+export function fetchAllBenchmarks(): Promise<{ state: string; total: number }> {
+  return request('/api/benchmarks/fetch-all', { method: 'POST' });
+}
+
+export function benchmarkFetchAllStatus(): Promise<{
+  running: boolean; done: number; total: number; states: Record<string, string>;
+}> {
+  return request('/api/benchmarks/fetch-all/status');
+}
+
+/** 深挖单条作品（收藏/评论）；平台未提供作品 ID 时后端会明确拒绝。 */
+export function fetchBenchmarkWorkDetail(id: string, workId: string): Promise<BenchWork> {
+  return request(`/api/benchmarks/${encodeURIComponent(id)}/works/${encodeURIComponent(workId)}/detail`,
+    { method: 'POST' });
+}
+
+/** 批量补齐收藏/评论：逐条打开作品页读取（串行 + 间隔，命中风控即停）。
+ *  limit 省略 = 把待补的全部补完（后端上限 40 条）。 */
+export function fetchBenchmarkWorksDetailBatch(id: string, limit = 0): Promise<{
+  state: string; total?: number; pending?: number; message?: string; reused?: boolean;
+}> {
+  return request(`/api/benchmarks/${encodeURIComponent(id)}/works/detail-batch?limit=${limit}`,
+    { method: 'POST' });
 }
 
 /** 用户显式停止：终止后端正在跑的对话 agent，释放会话锁，令下一句能立刻发。 */

@@ -188,3 +188,222 @@ def test_whoami_enriches_incomplete_identity_without_losing_verified_login(monke
     assert profile.call_count == (0 if complete else 1)
     assert dom.call_count == (0 if complete else 1)
     context.close.assert_called_once()
+
+
+# --------------------------------------------------------------------------- #
+# 登录短路：创作平台会话有效 ≠ 主站会话有效（2026-10-16 实测踩坑）
+# --------------------------------------------------------------------------- #
+class _ReachedQR(Exception):
+    """哨兵：证明流程走到了「取主站登录二维码」这一步。"""
+
+
+LOGIN_URL = "https://www.xiaohongshu.com/login?redirectPath=%2Fexplore"
+EXPLORE_URL = "https://www.xiaohongshu.com/explore"
+
+
+class _FakeLoginPage:
+    """假页面：goto 首页时按「主站是否已登录」决定停在 /login 还是信息流。
+
+    need_web 现在由**导航结果**判定（首页停在 /login = 游客态），假页面必须如实反映，
+    否则测试就没在测真实契约。
+    """
+
+    def __init__(self, web_logged_in: bool):
+        self.web_logged_in = web_logged_in
+        self.url = "about:blank"
+
+    def goto(self, url, **kwargs):
+        if url == EXPLORE_URL:
+            self.url = EXPLORE_URL if self.web_logged_in else LOGIN_URL
+        else:
+            self.url = url
+        return None
+
+    def wait_for_timeout(self, *a, **k):
+        return None
+
+    def content(self):
+        return ""
+
+
+class _FakeLoginContext:
+    def __init__(self, web_logged_in: bool):
+        self._page = _FakeLoginPage(web_logged_in)
+        self.pages: list = []
+
+    def new_page(self):
+        return self._page
+
+    def close(self):
+        return None
+
+
+class _FakePlaywright:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class _NoopLock:
+    def __init__(self, *a, **k):
+        pass
+
+    def acquire(self, timeout_s):
+        return None
+
+    def release(self):
+        return None
+
+
+def _login_args(timeout=1):
+    return SimpleNamespace(qr_out=None, timeout=timeout, status_file=None, profile_base=None,
+                           headed=False, proxy=None, no_proxy=True)
+
+
+def _patch_login(monkeypatch, *, web_logged_in, on_qr, scanned=False,
+                 page_web=False, creator=None):
+    """打桩整套登录环境。
+
+    web_logged_in: 首页导航是否落在信息流（False = 游客态 → need_web=True）
+    page_web:      轮询里「从页面读出的主站会话」（False/True/None，或 callable）
+    creator:       创作平台会话（默认一直有效；可传 callable 模拟先无后有）
+    """
+    monkeypatch.setattr("playwright.sync_api.sync_playwright", lambda: _FakePlaywright())
+    monkeypatch.setattr(xhs_publish, "_launch",
+                        lambda *a, **k: _FakeLoginContext(web_logged_in))
+    monkeypatch.setattr(xhs_publish, "_ProfileLock", _NoopLock)
+    monkeypatch.setattr(xhs_publish, "_creator_account",
+                        creator if callable(creator) else (lambda ctx: {"userId": "self"}))
+    monkeypatch.setattr(xhs_publish, "_page_web_session",
+                        page_web if callable(page_web) else (lambda page: page_web))
+    # 兜底探针：只在页面读不出身份时才会被问到
+    monkeypatch.setattr(xhs_publish, "_web_session_state", lambda ctx: False)
+    monkeypatch.setattr(xhs_publish, "_login_error", lambda page: "")
+    monkeypatch.setattr(xhs_publish, "_is_logged_in", lambda page: False)
+    monkeypatch.setattr(xhs_publish, "_qr_state", lambda page: ("scanned" if scanned else ""))
+    monkeypatch.setattr(xhs_publish, "_capture_login_qr", on_qr)
+
+
+def test_login_continues_to_qr_when_main_site_is_guest(monkeypatch):
+    """创作平台已登录但主站是游客态：必须继续取主站二维码。
+
+    回归的是这个坑：以前只看创作平台会话就直接 return「已登录」，
+    主站 web_session 永远修不好 —— 而对标账号读的正是主站公开页，
+    游客态下粉丝只会拿到「1万+」占位值。
+    """
+    reached: dict = {}
+
+    def on_qr(page, qr_out, need_web=False):
+        reached["qr"] = True
+        reached["need_web"] = need_web
+        raise _ReachedQR()          # 走到这里就够了，后面的轮询不再跑
+
+    _patch_login(monkeypatch, web_logged_in=False, on_qr=on_qr)
+    xhs_publish.cmd_login(_login_args())     # 外层会兜住异常并写失败状态，不影响断言
+
+    assert reached.get("qr") is True, "主站游客态时必须继续取二维码"
+    assert reached.get("need_web") is True, "主站会话未确认时必须只取主站码"
+
+
+def test_login_short_circuits_when_both_sessions_alive(monkeypatch):
+    """两个会话都有效时不弹二维码（不打扰已登录的用户）。"""
+    def on_qr(page, qr_out, need_web=False):  # pragma: no cover - 不该被调用
+        raise AssertionError("两个会话都有效时不该去取二维码")
+
+    _patch_login(monkeypatch, web_logged_in=True, page_web=True, on_qr=on_qr)
+    assert xhs_publish.cmd_login(_login_args()) == 0
+
+
+def test_login_success_requires_web_session_when_web_is_guest(monkeypatch):
+    """创作平台一直是好的：不能在主站会话还没建立时就宣布「登录成功」并关掉浏览器。
+
+    回归的是这个坑：扫码后的成功判定去问创作平台（它一直是好的）→ 秒判成功 → 关浏览器
+    → 主站登录走不完，只留下一个游客 web_session，粉丝数永远是占位值。
+    """
+    _patch_login(monkeypatch, web_logged_in=False, page_web=False,
+                 on_qr=lambda *a, **k: True, scanned=True)
+    rc = xhs_publish.cmd_login(_login_args(timeout=8))
+
+    assert rc == 1, "主站会话没建立时不得报成功"
+
+
+def test_login_succeeds_once_web_session_appears(monkeypatch):
+    """主站会话一建立就应立刻报成功（不必干等到超时）。"""
+    calls = {"n": 0}
+
+    def page_web(page):
+        calls["n"] += 1
+        return calls["n"] > 1        # 第一轮还是游客，之后已登录
+
+    _patch_login(monkeypatch, web_logged_in=False, page_web=page_web,
+                 on_qr=lambda *a, **k: True, scanned=True)
+    assert xhs_publish.cmd_login(_login_args(timeout=15)) == 0
+
+
+def test_creator_only_login_still_works_when_web_is_fine(monkeypatch):
+    """主站会话正常、只缺创作平台时：仍走扫码，并以创作平台会话判定成功。"""
+    reached: dict = {}
+    calls = {"n": 0}
+
+    def creator(ctx):
+        calls["n"] += 1
+        return None if calls["n"] <= 1 else {"userId": "self"}   # 首检无、扫码后有
+
+    def on_qr(page, qr_out, need_web=False):
+        reached["qr"] = True
+        return True
+
+    _patch_login(monkeypatch, web_logged_in=True, page_web=True, on_qr=on_qr,
+                 creator=creator, scanned=True)          # 扫码后页面进入「已扫描」态，触发会话复核
+    rc = xhs_publish.cmd_login(_login_args(timeout=15))
+
+    assert reached.get("qr") is True, "缺创作平台会话时应弹码"
+    assert rc == 0, "扫码后应报成功"
+
+
+# --------------------------------------------------------------------------- #
+# cookie 校验（纯 HTTP，不起浏览器）——「自有账号」页的会话健康依赖它
+# --------------------------------------------------------------------------- #
+def _write_cookie(tmp_path, value: str) -> str:
+    fp = tmp_path / "xhs.cookie"
+    fp.write_text(value, encoding="utf-8")
+    return str(fp)
+
+
+def test_cookie_whoami_without_web_session_reports_both_sessions(tmp_path, capsys):
+    """cookie 里没有 web_session：判定未登录，并说明创作平台会话在不在（不联网）。"""
+    rc = xhs_publish._whoami_via_cookie(_write_cookie(tmp_path, "a1=abc; webId=xyz"))
+
+    data = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert rc == 0 and data["loggedIn"] is False
+    assert data["sessions"]["web"]["ok"] is False
+    assert "web_session" in data["sessions"]["web"]["detail"]
+    assert data["sessions"]["creator"]["cookie_present"] is False
+
+
+def test_cookie_whoami_detects_creator_session(tmp_path, capsys):
+    """带上创作平台 cookie 时要能认出来（发布/后台用），全程不需要浏览器。"""
+    path = _write_cookie(
+        tmp_path, "web_session=; galaxy_creator_session_id=abc; customer-sso-sid=def")
+    xhs_publish._whoami_via_cookie(path)
+
+    data = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert data["sessions"]["creator"]["cookie_present"] is True
+
+
+def test_cookie_whoami_missing_file_is_reported(tmp_path, capsys):
+    """cookie 文件读不到时如实报错，而不是抛异常（whoami 必须永远输出 JSON）。"""
+    rc = xhs_publish._whoami_via_cookie(str(tmp_path / "nope.cookie"))
+
+    data = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert rc == 0 and data["loggedIn"] is False and "cookie 文件读不到" in data["error"]
+
+
+def test_self_user_id_from_cookie():
+    """从 cookie 里的 x-user-id 推断当前用户（用于读自己的主页确认会话）。"""
+    assert xhs_publish._whoami_self_user_id(
+        "a1=x; x-user-id-creator.xiaohongshu.com=55753cf4f5a2633511d5a652"
+    ) == "55753cf4f5a2633511d5a652"
+    assert xhs_publish._whoami_self_user_id("a1=x; web_session=y") == ""

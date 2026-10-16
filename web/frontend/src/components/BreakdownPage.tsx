@@ -1,17 +1,28 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { runAgent, createIdea } from '../lib/api';
 import { renderMarkdown } from '../lib/sanitize';
 import { IconFire, IconIdea, IconSkills } from './icons';
 
 interface BreakdownPageProps {
   persona: string;
+  /** 从「对标账号」等页面带过来的待拆解文本（用过即清，避免重复填充）。 */
+  seed?: string;
+  onSeedUsed?: () => void;
 }
 
-export default function BreakdownPage({ persona }: BreakdownPageProps) {
+export default function BreakdownPage({ persona, seed, onSeedUsed }: BreakdownPageProps) {
   const [input, setInput] = useState('');
   const [result, setResult] = useState('');
   const [loading, setLoading] = useState(false);
   const [toast, setToast] = useState('');
+
+  // 外部带内容进来：填进输入框并聚焦（换页/再带一次都能生效）
+  useEffect(() => {
+    if (!seed) return;
+    setInput(seed);
+    setResult('');
+    onSeedUsed?.();
+  }, [seed, onSeedUsed]);
 
   const run = async () => {
     if (!input.trim()) return;

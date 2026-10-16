@@ -5,6 +5,7 @@ import ChatPage from './components/ChatPage';
 import SkillPage from './components/SkillPage';
 import OutputsPage from './components/OutputsPage';
 import AccountsPage from './components/AccountsPage';
+import BenchmarksPage from './components/BenchmarksPage';
 import ProfilePage from './components/ProfilePage';
 import DashboardPage from './components/DashboardPage';
 import TrendsPage from './components/TrendsPage';
@@ -63,6 +64,9 @@ export default function App() {
   // `#/outputs/<路径>` 锚点，这里监听 hashchange 切页并带上下文，随后清掉 hash
   // （不污染地址栏与前进/后退历史）。
   const [outputsJump, setOutputsJump] = useState('');
+  // 对标账号 →「拆解这条」：把作品标题/来源带进爆款拆解页，用过即清
+  const [breakdownSeed, setBreakdownSeed] = useState('');
+  const clearBreakdownSeed = useCallback(() => setBreakdownSeed(''), []);
   useEffect(() => {
     const onHash = () => {
       const m = window.location.hash.match(/^#\/outputs\/(.+)$/);
@@ -538,15 +542,19 @@ export default function App() {
     sendUserAndStream(sessionId, displayText, attachments, legacyAgentText, userIndex);
   }, [sendUserAndStream]);
 
-  // 热点「一键做成内容」：新开会话，把选题作为指令发出去，跳到对话页。
-  const handleUseTopic = useCallback((title: string) => {
-    const prompt = `围绕当前热点「${title}」：先判断它适不适合我的账号赛道；若合适，给 2-3 个差异化的二创角度，并把你最推荐的那条写成可直接发布的文案初稿。`;
+  // 任意页面「带给 Agent 一段指令」：新开会话直接发出去并跳到对话页。
+  const handleAskAgent = useCallback((prompt: string) => {
     const ns = createSession(selectedPersona || undefined);
     setSessions((prev) => { const u = [ns, ...prev]; saveSessions(u); return u; });
     setActiveSessionId(ns.id);
     setCurrentPage('chat');
     sendUserAndStream(ns.id, prompt);
   }, [selectedPersona, sendUserAndStream]);
+
+  // 热点「一键做成内容」：新开会话，把选题作为指令发出去，跳到对话页。
+  const handleUseTopic = useCallback((title: string) => {
+    handleAskAgent(`围绕当前热点「${title}」：先判断它适不适合我的账号赛道；若合适，给 2-3 个差异化的二创角度，并把你最推荐的那条写成可直接发布的文案初稿。`);
+  }, [handleAskAgent]);
 
   const handleStopStream = useCallback((sessionId: string) => {
     streamCtl.current[sessionId]?.abort();
@@ -751,13 +759,16 @@ export default function App() {
       case 'publish':
         return <PublishPage persona={selectedPersona} />;
       case 'breakdown':
-        return <BreakdownPage persona={selectedPersona} />;
+        return <BreakdownPage persona={selectedPersona} seed={breakdownSeed} onSeedUsed={clearBreakdownSeed} />;
       case 'skills':
         return <SkillPage persona={selectedPersona} />;
       case 'outputs':
         return <OutputsPage jumpPath={outputsJump} onJumpHandled={clearOutputsJump} />;
       case 'accounts':
         return <AccountsPage />;
+      case 'benchmarks':
+        return <BenchmarksPage onAskAgent={handleAskAgent}
+          onBreakdown={(text) => { setBreakdownSeed(text); setCurrentPage('breakdown'); }} />;
       case 'profile':
         return <ProfilePage persona={selectedPersona} onNewProfile={() => setShowWizard(true)} onDeleted={handleProfileDeleted} />;
       default:
@@ -822,7 +833,7 @@ export default function App() {
         <div className="overlay">
           <div className="modal" style={{ width: 420, maxWidth: '100%', textAlign: 'center' }}>
             <div style={{ fontSize: 40 }}>👋</div>
-            <h2 style={{ margin: '12px 0 8px', fontSize: 20 }}>欢迎使用 Easel</h2>
+            <h2 style={{ margin: '12px 0 8px', fontSize: 20 }}>欢迎使用番茄工作台</h2>
             <p style={{ color: 'var(--text-secondary)', fontSize: 14, lineHeight: 1.6 }}>
               配置你的账号画像，生成的内容会更贴合你的风格、受众和平台调性。<br />
               大约 2 分钟，也可以随时在侧栏「+ 新建画像」补配。

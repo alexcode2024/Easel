@@ -4,7 +4,9 @@ import {
   accountWhoami, logoutAccount, submitLoginSms,
   saveCredentials, getCredentials, startMpLogin, mpLoginStatus,
 } from '../lib/api';
-import type { AccountItem, AccountWhoami } from '../lib/api';
+import { accountSession } from '../lib/api';
+import type { AccountItem, AccountWhoami, AccountSession } from '../lib/api';
+import CookieModal from './CookieModal';
 import { getWhoamiCache, setWhoamiCache, verifyStale } from '../lib/whoami';
 
 type QRState = {
@@ -39,7 +41,73 @@ function Avatar({ url, name }: { url?: string; name: string }) {
   return <div className="account-avatar account-avatar-fallback">{initial}</div>;
 }
 
+/** 小红书会话健康面板：主站（读数据）与创作平台（发布）分别显示状态。
+ *
+ * 两套会话相互独立——只粘主站 cookie 时读数据正常但发布不可用，反之亦然，
+ * 所以必须分开显示，并让用户能一键实测（纯 HTTP，约 1 秒，不起浏览器）。
+ */
+function XhsSessionPanel({ platform, onChanged }: { platform: string; onChanged: () => void }) {
+  const [state, setState] = useState<AccountSession | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState('');
+
+  const check = useCallback(async (force = true) => {
+    setBusy(true);
+    if (force) setMsg('');
+    try {
+      const r = await accountSession(platform, force);
+      setState(r);
+      // 必须给反馈：以前这里静默 catch，点了像没反应（用户实测反馈）
+      if (force) {
+        if (r.error) setMsg(`检查失败：${r.error}`);
+        else if (r.web?.ok) setMsg(`✓ 主站会话有效${r.name ? `（${r.name}）` : ''}`);
+        else if (r.web) setMsg(`✗ ${r.web.detail || '主站会话无效'}`);
+        else setMsg(r.hint || '未配置 cookie');
+      }
+      if (force) onChanged();      // 实测后刷新账号列表，卡片徽章不会与面板自相矛盾
+    } catch (e) {
+      if (force) setMsg(`检查失败：${e instanceof Error ? e.message : '未知错误'}`);
+    } finally { setBusy(false); }
+  }, [platform, onChanged]);
+
+  useEffect(() => { check(false); }, [check]);
+
+  const dot = (ok?: boolean) => (
+    <span className={`sess-dot ${ok ? 'ok' : ok === false ? 'bad' : 'unknown'}`} />
+  );
+  const configured = state?.cookie?.saved;
+
+  return (
+    <div className="xhs-session">
+      <div className="xhs-session-row">
+        {dot(configured ? state?.web?.ok : undefined)}
+        <span className="xhs-session-label">读数据（主站）</span>
+        <span className="xhs-session-detail">
+          {!configured ? '未配置 cookie'
+            : state?.web?.ok ? `有效${state.name ? ` · ${state.name}` : ''}`
+            : state?.web?.detail || '未知'}
+        </span>
+      </div>
+      <div className="xhs-session-row">
+        {/* 创作平台会话是可选的：手动发布就不需要它，所以没配也**不显示成故障**（灰点而非红点） */}
+        {dot(state?.creator?.cookie_present ? true : undefined)}
+        <span className="xhs-session-label">自动发布</span>
+        <span className="xhs-session-detail">
+          {state?.creator?.cookie_present
+            ? '已配置创作平台会话'
+            : '手动发布（无需配置）'}
+        </span>
+      </div>
+      <button className="bench-act" disabled={busy} onClick={() => check(true)}>
+        {busy ? '检查中…' : '检查会话'}
+      </button>
+      {msg && <div className="xhs-session-msg">{msg}</div>}
+    </div>
+  );
+}
+
 export default function AccountsPage() {
+  const [cookieModal, setCookieModal] = useState(false);
   const [accounts, setAccounts] = useState<AccountItem[]>([]);
   const [err, setErr] = useState('');
   const [qr, setQr] = useState<QRState | null>(null);
@@ -394,7 +462,10 @@ export default function AccountsPage() {
         <div>
           <h1 className="page-title">账号登录 Accounts</h1>
           <p className="page-subtitle">
-            用手机 App 扫码登录，登录态本地持久化，之后发布免登。<br />
+            小红书推荐<strong>粘贴浏览器 cookie</strong>（点卡片上的「🔑 Cookie」）：读数据与校验走纯 HTTP，
+            不起浏览器、不弹窗、也不会被判 300012；需要发布/后台时再补上
+            <code>creator.xiaohongshu.com</code> 的 cookie。<br />
+            其它平台仍用手机 App 扫码登录，登录态本地持久化，之后发布免登。<br />
             ⚠️ 平台可能对机房/代理 IP 判风险导致二维码弹不出，需干净/家宽 IP，或在正常网络登录后拷贝登录态目录。
           </p>
         </div>
@@ -428,7 +499,19 @@ export default function AccountsPage() {
                 <div className="account-card-note">{a.note ? a.note : `后端：${a.name}`}</div>
               )}
 
+              {/* 小红书：cookie 会话健康（读数据走纯 HTTP，与发布用的创作平台会话分开显示） */}
+              {a.backend === 'xhs' && (
+                <XhsSessionPanel platform={a.platform} onChanged={load} />
+              )}
+
               <div style={{ display: 'flex', gap: 8, marginTop: 'auto' }}>
+                {a.backend === 'xhs' && (
+                  <button className="btn btn-sm btn-ghost"
+                    title="粘贴浏览器里复制的 cookie：之后小红书读数据/校验都走纯 HTTP，不用扫码也不用起浏览器"
+                    onClick={() => setCookieModal(true)}>
+                    🔑 Cookie
+                  </button>
+                )}
                 {logged ? (
                   <>
                     <button className="btn btn-sm" style={{ flex: 1 }}
@@ -545,6 +628,17 @@ export default function AccountsPage() {
             </div>
           </div>
         </div>
+      )}
+
+      {/* 平台 Cookie：小红书读数据/校验走纯 HTTP 的凭证 */}
+      {cookieModal && (
+        <CookieModal initialPlatform="xiaohongshu"
+          onClose={() => setCookieModal(false)}
+          onSaved={() => {
+            setCookieModal(false);
+            // 配置变化后立刻重查一次会话（纯 HTTP，约 1 秒）
+            accountSession('xiaohongshu', true).catch(() => {});
+          }} />
       )}
     </div>
   );

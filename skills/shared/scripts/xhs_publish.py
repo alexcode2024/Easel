@@ -47,6 +47,7 @@ import content_guard  # noqa: E402  出站内容安全闸门
 # --------------------------------------------------------------------------- #
 PUBLISH_URL = "https://creator.xiaohongshu.com/publish/publish?source=official"
 EXPLORE_URL = "https://www.xiaohongshu.com/explore"
+WEB_LOGIN_URL = "https://www.xiaohongshu.com/login"   # 主站登录页（对标数据依赖主站会话）
 CREATOR_LOGIN_URL = "https://creator.xiaohongshu.com/login"
 CREATOR_HOME_URL = "https://creator.xiaohongshu.com/new/home"
 CREATOR_ACCOUNT_URL = "https://creator.xiaohongshu.com/api/galaxy/user/info"
@@ -323,16 +324,24 @@ def _missing_qr_reason(page) -> str:
     return "未找到可识别的登录二维码，登录弹窗未打开或页面结构已变化"
 
 
-def _capture_login_qr(page, qr_out: Path, *, creator_only: bool = False) -> bool:
-    """首页无法出码时只尝试一次官方创作平台入口；False 表示已登录。"""
+def _capture_login_qr(page, qr_out: Path, *, need_web: bool = False) -> bool:
+    """抠登录二维码存 PNG。``False`` 表示已经登录，不需要扫码。
+
+    ``need_web=True``（本次要补**主站**会话）时**只取主站登录页的码**：
+    以前主站入口打不开就静默回落到创作平台入口，用户扫了创作平台的码、登录器随即报成功，
+    而主站会话始终是游客态（实测 2026-10-16 的两次假成功）。拿不到主站码就如实报错，
+    绝不静默换一个「扫了也没用」的码给用户。
+    """
     failures = []
-    for url in ((CREATOR_LOGIN_URL,) if creator_only else (None, CREATOR_LOGIN_URL)):
-        entry = "创作平台" if url else "小红书首页"
+    candidates = ((WEB_LOGIN_URL,) if need_web else (None, CREATOR_LOGIN_URL))
+    for url in candidates:
+        entry = "小红书主站登录页" if url == WEB_LOGIN_URL else (
+            "创作平台" if url else "小红书首页")
         try:
             if url:
                 page.goto(url, wait_until="commit", timeout=30000)
         except Exception as error:
-            reason = f"打不开小红书创作平台（{type(error).__name__}），请检查网络连接后重试"
+            reason = f"打不开{entry}（{type(error).__name__}），请检查网络连接后重试"
             failures.append(f"{entry}：{reason}")
             continue
         if _is_logged_in(page):
@@ -539,6 +548,61 @@ def _state_account(state: dict) -> dict | None:
 
 def _web_account_html(html: str) -> dict | None:
     return _state_account(_initial_state(html))
+
+
+def _page_web_session(page) -> bool | None:
+    """用**当前页面**判断主站会话，不发额外请求。
+
+    - 停在 ``/login`` → 游客态（``False``）
+    - 已跳到别的页面 → 读该页 SSR 里的登录身份（``True``/``False``）
+
+    为什么不复用 ``_web_session_state(ctx)``：那是 ``ctx.request.get`` + 4s 超时。
+    登录窗口内它一旦超时返回「未知」，就会被当成「主站没问题」，于是成功判定又回落到
+    创作平台会话上——正是 2026-10-16 那次假成功（扫码后 4 秒就宣布成功、关掉浏览器，
+    主站的登录轮询根本没走完，只留下一个游客 web_session）。
+    """
+    try:
+        url = (page.url or "").lower()
+    except Exception:
+        return None
+    if "/login" in url:
+        return False
+    try:
+        state = _initial_state(page.content())
+    except Exception:
+        return None
+    if not state:
+        return None
+    return _state_account(state) is not None
+
+
+def _web_session_state(context) -> bool | None:
+    """主站(www)会话三态：``True`` 已登录 / ``False`` 明确游客 / ``None`` 探测不了（未知）。
+
+    给非浏览器调用方（whoami 等只读探测）用。**登录流程不要用它决定成功与否**：
+    它的 4s 超时会把「探测失败」变成「未知」，而登录窗口内的时间压力正好会踩到这一点
+    （见 ``_page_web_session`` 的说明）。
+    """
+    try:
+        response = context.request.get(EXPLORE_URL, timeout=4000)
+    except Exception:
+        return None
+    if response.status != 200:
+        return None
+    state = _initial_state(response.text())
+    if not state:
+        return None
+    if _state_account(state) is not None:
+        return True
+    user = state.get("user")
+    if not isinstance(user, dict):
+        return None
+    info = _unwrap_state(user.get("userInfo"))
+    if isinstance(info, dict) and info.get("guest") is True:
+        return False
+    if _unwrap_state(user.get("loggedIn")) is False:
+        return False
+    return None
 
 
 def _self_profile_identity(state: dict, user_id: str) -> dict:
@@ -1112,12 +1176,18 @@ def cmd_login(a) -> int:
             except Exception as e:
                 login_state.write_status(sf, "error", "浏览器没能打开。请关闭弹窗，等 10 秒再点登录，不要连点。")
                 _die(f"启动浏览器失败：{e}", 1)
-            page = ctx.pages[0] if ctx.pages else ctx.new_page()
+            # 用**新开的页面**跑登录：持久化上下文恢复出来的旧页面可能停在创作平台，
+            # 在那种页面上 goto 主站首页会失败（实测 trace：url=creator.xiaohongshu.com/login），
+            # 而导航失败又会被当成「主站没问题」→ 永远在抓创作平台的码。
+            page = ctx.new_page()
             try:
-                if _creator_account(ctx) is not None:
-                    login_state.write_status(sf, "success", "已登录")
-                    print("✅ 已登录（创作平台账号接口已确认），无需扫码")
-                    return 0
+                # 创作平台会话 ≠ 主站(www)会话：两套 cookie 相互独立，必须分别确认。
+                # 已知故障（2026-10-16 实测）：只查创作平台会把「主站游客态」当成已登录——
+                #   ① 点登录直接返回「已登录」，二维码不弹；
+                #   ② 就算弹了码，扫码后的成功判定又问创作平台，而它一直是好的，
+                #      于是立刻宣布成功并关掉浏览器 → 主站登录永远走不完（只发了个游客 web_session）。
+                # 对标账号读的正是主站公开页：游客态下粉丝等字段只会拿到「1万+」占位值。
+                creator_alive = _creator_account(ctx) is not None
                 if a.headed:
                     login_state.write_status(
                         sf, "window_login",
@@ -1127,7 +1197,19 @@ def cmd_login(a) -> int:
                     page.goto(EXPLORE_URL, wait_until="commit", timeout=30000)
                 except Exception as error:
                     explore_failed = True
-                    print(f"小红书首页无法打开（{type(error).__name__}），尝试官方创作平台入口",
+                    print(f"小红书首页无法打开（{type(error).__name__}），改走主站登录页",
+                          file=sys.stderr)
+
+                # 「本次要不要补主站登录」= 主站会话**没被确认**为已登录。
+                # 首页压根没打开时不去读页面（上面可能还是上一轮留下的旧页面，
+                # 拿它判断会得出「已登录」的假结论）——直接算未确认，必须补主站登录。
+                need_web = True if explore_failed else (_page_web_session(page) is not True)
+                if creator_alive and not need_web:
+                    login_state.write_status(sf, "success", "已登录")
+                    print("✅ 已登录（创作平台 + 主站会话均已确认），无需扫码")
+                    return 0
+                if creator_alive and need_web:
+                    print("⚠️ 创作平台已登录，但主站(www)会话未确认——继续获取主站登录二维码",
                           file=sys.stderr)
 
                 # 等待页面稳定并完成可能的跳转（登录引导 / 风险拦截 / 已登录态）
@@ -1141,7 +1223,9 @@ def cmd_login(a) -> int:
                     except Exception:
                         pass
 
-                if _is_logged_in(page):
+                # 注意：_is_logged_in 的选择器/分支是创作平台那套，在主站页面上判定不了
+                # 「已登录」。要补主站登录时（need_web）不能让它宣布成功。
+                if (not need_web) and _is_logged_in(page):
                     login_state.write_status(sf, "success", "已登录")
                     print("✅ 已登录（cookie 已在持久化目录），无需扫码")
                     return 0
@@ -1149,7 +1233,7 @@ def cmd_login(a) -> int:
                 # 抠二维码存 PNG（元素截图，不依赖 src 格式，最稳）
                 qr = False
                 try:
-                    qr = _capture_login_qr(page, qr_out, creator_only=explore_failed)
+                    qr = _capture_login_qr(page, qr_out, need_web=need_web)
                     if not qr:
                         login_state.write_status(sf, "success", "已登录")
                         print("✅ 已登录（创作平台登录态已在持久化目录），无需扫码")
@@ -1179,9 +1263,18 @@ def cmd_login(a) -> int:
                 next_account_check = next_refresh
                 scanned = False
                 refreshes = 0
+                last_trace: tuple | None = None
                 while time.time() < deadline:
+                    page_state: bool | None = None
                     try:
-                        logged_in = _is_logged_in(page)
+                        if need_web:
+                            # 要补主站登录时，成功只能由**主站**证据决定：
+                            # _is_logged_in 的判定逻辑属于创作平台，在 www 页面上不成立，
+                            # 拿它当信号会在扫码后立刻假成功（实测故障）。
+                            page_state = _page_web_session(page)   # 不发请求，读当前页
+                            logged_in = page_state is True
+                        else:
+                            logged_in = _is_logged_in(page)
                     except Exception as e:
                         err = str(e).lower()
                         if a.headed and ("target" in err or "closed" in err or "has been closed" in err):
@@ -1193,9 +1286,31 @@ def cmd_login(a) -> int:
                     if state == "scanned" and not scanned:
                         scanned = True
                         login_state.write_status(sf, "scanned", "扫码成功，请在小红书 App 中确认；正在等待登录完成")
+                    # 主站登录：扫码确认后页面会离开 /login。此时优先信页面自己的 HTML；
+                    # 只有在页面读不出身份时，才补一次会话请求坐实（每 5s 一次）。
+                    left_login = need_web and "/login" not in (page.url or "").lower()
+                    # 状态变化时留一行痕迹（Web 端把 stderr 也写进 outputs/_login/<平台>.log）：
+                    # 下次再出问题，日志里能直接看到卡在哪一步，不用靠猜。
+                    trace = (need_web, logged_in, scanned, left_login, page_state,
+                             bool((page.url or "").split("?")[0].endswith("/login")))
+                    if trace != last_trace:
+                        last_trace = trace
+                        print(f"[trace] need_web={need_web} logged_in={logged_in} scanned={scanned} "
+                              f"left_login={left_login} page_state={page_state} "
+                              f"url={(page.url or '')[:70]}", file=sys.stderr)
                     if not logged_in and (reason or (
-                            scanned and time.monotonic() >= next_account_check)):
-                        logged_in = _creator_account(ctx) is not None
+                            (scanned or left_login) and time.monotonic() >= next_account_check)):
+                        if need_web:
+                            if page_state is True:
+                                logged_in = True
+                            elif left_login:
+                                # 页面离开了 /login，但它可能是**笔记页/信息流**——那些页面的
+                                # SSR 结构里没有登录身份（实测：扫码确认后跳进笔记页，
+                                # 页面读不出身份 → 被误判成还没登录，白等到超时）。
+                                # 这里用一次只读探测坐实，每 5s 一次，不会高频打接口。
+                                logged_in = _web_session_state(ctx) is True
+                        else:
+                            logged_in = _creator_account(ctx) is not None
                         next_account_check = time.monotonic() + 5
                     if logged_in:
                         login_state.write_status(sf, "success", "登录成功")
@@ -1364,9 +1479,106 @@ def cmd_publish_video(a) -> int:
     return _publish(a, "video")
 
 
+# 创作平台（发布用）与主站（读数据用）是两套独立会话，cookie 名字也不同。
+CREATOR_COOKIE_NAMES = ("galaxy_creator_session_id", "customer-sso-sid",
+                        "access-token-creator.xiaohongshu.com", "customerClientId")
+WEB_COOKIE_NAMES = ("web_session",)
+
+
+def _whoami_via_cookie(cookie_file: str) -> int:
+    """纯 HTTP 校验登录态 + 读昵称/头像：调签名的 ``/api/sns/web/v2/user/me``（一次请求）。
+
+    做法：curl_cffi 伪装 Chrome 指纹 + ``xhshow`` 生成签名头。
+    返回 JSON 里额外带 ``sessions``，供「自有账号」页展示两个会话的健康度。
+
+    ⚠️ 别再用首页 SSR 判断登录态：``/explore`` 的 ``__INITIAL_STATE__`` **没有 user 字段**
+    （实测 ``user.loggedIn`` 恒为 None），据此判断会把有效会话误报成"已失效"——
+    这个假阴性坑过一次，改成问「我是谁」这个接口才可靠。
+    """
+    result: dict = {"loggedIn": False, "name": "", "avatar": "", "sessions": {}}
+    try:
+        cookie = Path(cookie_file).expanduser().read_text(encoding="utf-8").strip()
+    except OSError as error:
+        result["error"] = f"cookie 文件读不到：{error}"
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
+    names = {p.split("=", 1)[0].strip() for p in cookie.split(";") if "=" in p}
+    has_creator = any(n in names for n in CREATOR_COOKIE_NAMES)
+    result["sessions"]["creator"] = {
+        "cookie_present": has_creator,
+        "optional": True,     # 手动发布就不需要它，界面上不该显示成故障
+        "detail": ("cookie 内含创作平台会话，可用于自动发布" if has_creator
+                   else "未配置创作平台会话（可选）：手动发布不需要它；"
+                        "以后要让程序自动发布，再粘贴 creator.xiaohongshu.com 的 cookie 即可"),
+    }
+    if not any(n in names for n in WEB_COOKIE_NAMES):
+        result["sessions"]["web"] = {"ok": False, "detail": "cookie 里没有 web_session（主站会话）"}
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from curl_cffi import requests as creq
+
+        import xhs_fetch  # 同目录的抓取模块，复用其 cookie 解析
+
+        from xhshow import Xhshow
+
+        jar = xhs_fetch.parse_cookie(cookie)
+        signer = Xhshow()
+        endpoint = "https://edith.xiaohongshu.com/api/sns/web/v2/user/me"
+        params: dict = {}
+        url = signer.build_url(endpoint, params)      # 必须用库的 URL：签名覆盖查询串
+        headers = signer.sign_headers_get(uri=endpoint, cookies=jar, params=params) | {
+            "accept": "application/json, text/plain, */*",
+            "accept-language": "zh-CN",
+            "origin": "https://www.xiaohongshu.com",
+            "referer": "https://www.xiaohongshu.com/",
+            "user-agent": xhs_fetch.UA,
+        }
+        response = creq.get(url, headers=headers, cookies=jar, timeout=20, verify=False,
+                            allow_redirects=True, impersonate="chrome")
+        body = response.json() if response.status_code == 200 else {}
+        data = body.get("data") or {}
+        if body.get("success") and data.get("user_id"):
+            result["loggedIn"] = True
+            result["name"] = data.get("nickname") or ""
+            result["avatar"] = data.get("imageb") or data.get("image") or ""
+            result["sessions"]["web"] = {
+                "ok": True, "user_id": data.get("user_id"),
+                "nickname": data.get("nickname") or "", "red_id": data.get("red_id") or "",
+                "detail": "主站会话有效",
+            }
+        else:
+            detail = ("主站会话已失效（平台判游客态：cookie 过期或被降级）"
+                      if response.status_code == 200 else
+                      f"主站校验失败：HTTP {response.status_code}")
+            result["sessions"]["web"] = {"ok": False, "detail": detail}
+    except Exception as error:  # noqa: BLE001 — whoami 永远输出 JSON
+        result["error"] = f"{type(error).__name__}: {error}"
+        result["sessions"]["web"] = {"ok": False, "detail": f"校验失败：{error}"}
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
+def _whoami_self_user_id(cookie: str) -> str:
+    """从 cookie 里推断当前登录用户的 user_id（创作平台会话 cookie 里带 x-user-id）。"""
+    for part in cookie.split(";"):
+        name, _, value = part.strip().partition("=")
+        if name.strip().lower().startswith("x-user-id") and value.strip():
+            return value.strip().strip('"')
+    return ""
+
+
 def cmd_whoami(a) -> int:
     """真校验登录态 + 读账号昵称/头像，输出单行 JSON（供 Web 后端解析）。
-    xhs 须直连（--no-proxy），走代理会被判风险。抽不到昵称时 name 空但 loggedIn 仍准。"""
+
+    给了 ``--cookie-file`` 就走**纯 HTTP**（curl_cffi 指纹伪装，不起浏览器、秒级返回）；
+    没给才回退到原来的 headless 浏览器真校验。xhs 须直连（--no-proxy），走代理会被判风险。
+    抽不到昵称时 name 空但 loggedIn 仍准。
+    """
+    cookie_file = getattr(a, "cookie_file", "") or ""
+    if cookie_file:
+        return _whoami_via_cookie(cookie_file)
     try:
         from playwright.sync_api import sync_playwright
     except Exception as e:
@@ -1517,6 +1729,8 @@ def main() -> int:
 
     p = sub.add_parser("whoami", help="真校验登录态 + 读昵称/头像（输出 JSON）")
     add_common(p)
+    p.add_argument("--cookie-file", default="",
+                   help="给了就走纯 HTTP 校验（不起浏览器、秒级返回）")
     p.set_defaults(func=cmd_whoami)
 
     sub.add_parser("selftest", help="离线自检").set_defaults(func=cmd_selftest)

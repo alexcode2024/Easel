@@ -1,0 +1,682 @@
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import {
+  fetchBenchPlatforms, fetchBenchmarks, fetchBenchmark, createBenchmark, deleteBenchmark,
+  fetchBenchmarkNow, fetchBenchmarkWorkDetail, fetchBenchmarkWorksDetailBatch,
+  fetchAllBenchmarks, benchmarkFetchAllStatus,
+  fetchBenchCookies, downloadBenchWork,
+  mediaUrl, createIdea,
+} from '../lib/api';
+import type { BenchAccount, BenchDetail, BenchPlatform, BenchWork, BenchCookieStatus } from '../lib/api';
+import CookieModal from './CookieModal';
+import { IconAccounts, IconTrash, IconChevron, IconIdea, IconChat } from './icons';
+
+/** 对标账号：管理「别人的」公开账号，看他们最近在发什么、哪些是爆款。
+ *
+ *  与「自有账号」的区别：这里的数据全部来自平台**公开**信息，
+ *  平台不公开的字段（如小红书的累计收藏/评论）一律显示「—」，
+ *  不估算、不编造——这是仓库既定红线（skill-competitor-analysis/references/data-collection.md）。
+ */
+interface BenchmarksPageProps {
+  onAskAgent: (prompt: string) => void;
+  onBreakdown?: (text: string) => void;
+}
+
+const fmtNum = (n: number | null | undefined): string => {
+  if (n === null || n === undefined) return '—';
+  if (n >= 100000000) return `${(n / 100000000).toFixed(1)}亿`;
+  if (n >= 10000) return `${(n / 10000).toFixed(1)}万`;
+  return String(n);
+};
+
+/** 指标展示：平台给的展示串（如「1万+」）原样保留；
+ *  平台给精确数字时（TikTok/抖音返回整数）按中文习惯缩写，避免出现「96300000」。 */
+function metricText(m: { raw: string; num: number | null; lower_bound: boolean } | null | undefined): string {
+  if (!m || (m.num === null && !m.raw)) return '—';
+  const raw = (m.raw || '').trim();
+  const pureNumber = /^[\d.,\s]+$/.test(raw);
+  if (raw && !pureNumber) return raw;
+  return m.num === null ? raw : fmtNum(m.num);
+}
+
+function timeAgo(ms: number | null | undefined): string {
+  if (!ms) return '—';
+  const d = new Date(ms);
+  if (Number.isNaN(d.getTime())) return '—';
+  const diff = Date.now() - d.getTime();
+  if (diff < 0) return d.toLocaleDateString('zh-CN');
+  const day = 86400000;
+  if (diff < 3600000) return `${Math.max(1, Math.floor(diff / 60000))} 分钟前`;
+  if (diff < day) return `${Math.floor(diff / 3600000)} 小时前`;
+  if (diff < day * 30) return `${Math.floor(diff / day)} 天前`;
+  return d.toLocaleDateString('zh-CN');
+}
+
+export default function BenchmarksPage({ onAskAgent, onBreakdown }: BenchmarksPageProps) {
+  const [accounts, setAccounts] = useState<BenchAccount[]>([]);
+  const [platforms, setPlatforms] = useState<BenchPlatform[]>([]);
+  const [detail, setDetail] = useState<BenchDetail | null>(null);
+  const [selected, setSelected] = useState<string | null>(null);
+  const [form, setForm] = useState<{ platform: string; target: string; remark: string } | null>(null);
+  const [toast, setToast] = useState('');
+  const [err, setErr] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [bulk, setBulk] = useState<{ running: boolean; done: number; total: number } | null>(null);
+  const [showAllWorks, setShowAllWorks] = useState(false);
+  const [busyWork, setBusyWork] = useState('');
+  const [syncBudget, setSyncBudget] = useState(10);   // 刷新时最多补下几条新作品的素材
+  const [cookies, setCookies] = useState<BenchCookieStatus[]>([]);
+  const [cookieForm, setCookieForm] = useState<{ platform: string; value: string } | null>(null);
+  const pollRef = useRef<number | null>(null);
+  // 冷却倒计时：后端只在响应里给「还剩多少秒」，不会自己走；这里记下列表拉取时刻本地递减，
+  // 否则抓完一次后行内刷新按钮会一直灰着直到刷新页面。
+  const listAtRef = useRef(Date.now());
+  const [, setTick] = useState(0);
+
+  const showToast = (m: string) => { setToast(m); setTimeout(() => setToast(''), 2600); };
+
+  const cooldownLeft = useCallback((a: BenchAccount): number => {
+    const base = a.cooldown_left ?? 0;
+    if (base <= 0) return 0;
+    return Math.max(0, Math.round(base - (Date.now() - listAtRef.current) / 1000));
+  }, []);
+
+  const loadList = useCallback(() => {
+    listAtRef.current = Date.now();
+    fetchBenchmarks().then(setAccounts).catch((e) => setErr(String(e.message || e)));
+  }, []);
+
+  const loadDetail = useCallback((id: string) => {
+    fetchBenchmark(id).then(setDetail).catch((e) => setErr(String(e.message || e)));
+  }, []);
+
+  useEffect(() => {
+    fetchBenchPlatforms().then((r) => setPlatforms(r.platforms)).catch(() => {});
+    fetchBenchCookies().then(setCookies).catch(() => {});
+    loadList();
+  }, [loadList]);
+
+  useEffect(() => {
+    if (selected) { setShowAllWorks(false); loadDetail(selected); }
+    else setDetail(null);
+  }, [selected, loadDetail]);
+
+  // 抓取中轮询：抓一次 30s～几分钟，必须异步 + 轮询（同步请求会被代理超时掐断）
+  useEffect(() => {
+    const running = accounts.some((a) => a.running || a.fetch?.state === 'running')
+      || (bulk?.running ?? false);
+    if (!running) {
+      if (pollRef.current) { window.clearInterval(pollRef.current); pollRef.current = null; }
+      return;
+    }
+    if (pollRef.current) return;
+    pollRef.current = window.setInterval(async () => {
+      try {
+        const list = await fetchBenchmarks();
+        listAtRef.current = Date.now();
+        setAccounts(list);
+        if (selected) loadDetail(selected);
+        const b = await benchmarkFetchAllStatus();
+        setBulk((prev) => (prev ? { ...prev, running: b.running, done: b.done, total: b.total } : prev));
+      } catch { /* 轮询失败忽略，下轮再试 */ }
+    }, 3000);
+    return () => {
+      if (pollRef.current) { window.clearInterval(pollRef.current); pollRef.current = null; }
+    };
+  }, [accounts, bulk, selected, loadDetail]);
+
+  const platMeta = useMemo(() => {
+    const map: Record<string, BenchPlatform> = {};
+    for (const p of platforms) map[p.platform] = p;
+    return map;
+  }, [platforms]);
+
+  // 有账号在冷却中时每秒重绘一次，让「冷却 4:32」真的在走
+  useEffect(() => {
+    const anyCooling = accounts.some((a) => (a.cooldown_left ?? 0) > 0);
+    if (!anyCooling) return;
+    const t = window.setInterval(() => setTick((n) => n + 1), 1000);
+    return () => window.clearInterval(t);
+  }, [accounts]);
+
+  const openNew = () => {
+    const first = platforms.find((p) => p.auto) || platforms[0];
+    setForm({ platform: first?.platform || 'xiaohongshu', target: '', remark: '' });
+  };
+
+  const submit = async () => {
+    if (!form) return;
+    setBusy(true); setErr('');
+    try {
+      const acc = await createBenchmark({ platform: form.platform, target: form.target, remark: form.remark });
+      setForm(null);
+      loadList();
+      showToast('已添加');
+      if (platMeta[acc.platform]?.auto) {
+        // 添加后直接抓一次，省得用户再点一下
+        await fetchBenchmarkNow(acc.id).catch(() => {});
+        loadList();
+      }
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : '添加失败');
+    } finally { setBusy(false); }
+  };
+
+  const refresh = async (acc: BenchAccount) => {
+    setErr('');
+    try {
+      await fetchBenchmarkNow(acc.id, syncBudget);
+      loadList();
+      if (selected === acc.id) loadDetail(acc.id);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : '抓取失败');
+    }
+  };
+
+  const remove = async (acc: BenchAccount) => {
+    if (!window.confirm(`删除对标账号「${acc.nickname || acc.account_id}」？抓取到的数据和封面缓存会一并删除。`)) return;
+    await deleteBenchmark(acc.id);
+    if (selected === acc.id) setSelected(null);
+    loadList();
+  };
+
+  const refreshAll = async () => {
+    setErr('');
+    try {
+      const r = await fetchAllBenchmarks();
+      setBulk({ running: true, done: 0, total: r.total });
+      showToast(`开始串行刷新 ${r.total} 个账号（不并发，避免账号被降级）`);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : '批量刷新失败');
+    }
+  };
+
+  const toIdeas = async (w: BenchWork, acc: BenchAccount) => {
+    await createIdea({
+      title: w.title.slice(0, 60),
+      note: `来源：对标账号「${acc.nickname || acc.account_id}」（${acc.platform_name}）\n`
+        + `点赞 ${w.likes ?? '—'}｜收藏 ${w.favorites ?? '—'}｜评论 ${w.comments ?? '—'}\n`
+        + `${w.url || '（平台未返回作品链接）'}`,
+      source: '对标账号',
+      status: 'pending',
+    });
+    showToast('已存入选题库');
+  };
+
+  const deepDive = async (w: BenchWork) => {
+    if (!selected) return;
+    try {
+      await fetchBenchmarkWorkDetail(selected, w.id);
+      loadDetail(selected);
+      showToast('已深挖该条数据');
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : '深挖失败');
+    }
+  };
+
+  // 下载这条笔记的全部数据：元数据 + 图片原图（含动图）+ 视频（默认 1080p）。
+  // 链接不用粘贴——作品列表里已经有 note_id 与 xsec_token。
+  const downloadWork = async (w: BenchWork) => {
+    if (!selected) return;
+    setErr('');
+    setBusyWork(w.id);
+    try {
+      const r = await downloadBenchWork(selected, w.id);
+      showToast(r.message || '开始下载…');
+      loadDetail(selected);            // 状态由后端写入，轮询会带出进度
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : '下载失败');
+    } finally {
+      setTimeout(() => setBusyWork(''), 4000);
+    }
+  };
+
+  // 批量补齐收藏/评论：逐条打开作品页（串行 + 间隔，风控即停），进度靠已有轮询刷新
+  const deepDiveBatch = async () => {
+    if (!selected) return;
+    setErr('');
+    try {
+      const r = await fetchBenchmarkWorksDetailBatch(selected, 0);   // 0 = 把待补的全部补完
+      if (r.state === 'done') { showToast(r.message || '都已补齐'); loadDetail(selected); return; }
+      loadDetail(selected);
+      showToast(`开始逐条读取 ${r.total ?? ''} 条作品（每条约 4-7 秒；中途停手已完成的部分会保留）`);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : '批量深挖失败');
+    }
+  };
+
+  const autoPlatforms = platforms.filter((p) => p.auto);
+  const manualPlatforms = platforms.filter((p) => !p.auto);
+
+  return (
+    <div className="page-scroll bench-page">
+      <div className="page-head">
+        <div>
+          <h1 className="page-title"><IconAccounts size={21} /> 对标账号</h1>
+          <p className="page-subtitle">
+            盯住同赛道账号在发什么、哪条跑出来了。数据来自平台<strong>公开</strong>信息，
+            平台不公开的字段显示「—」，不估算。
+          </p>
+        </div>
+        <div style={{ display: 'flex', gap: 8 }}>
+          {selected && <button className="btn btn-sm" onClick={() => setSelected(null)}>← 返回列表</button>}
+          {!selected && accounts.some((a) => platMeta[a.platform]?.auto) && (
+            <button className="btn btn-sm" onClick={refreshAll} disabled={bulk?.running}>
+              {bulk?.running ? `刷新中 ${bulk.done}/${bulk.total}` : '⟳ 全部刷新'}
+            </button>
+          )}
+          {!selected && (
+            <button className="btn btn-sm" title="粘贴浏览器里的 cookie：小红书可据此走纯 HTTP 取数（不用浏览器）"
+              onClick={() => {
+                const first = cookies[0];
+                setCookieForm({ platform: first?.platform || 'xiaohongshu', value: '' });
+              }}>
+              🔑 Cookie
+              {cookies.some((c) => c.saved) && <span className="bench-tag ok" style={{ marginLeft: 5 }}>已配置</span>}
+            </button>
+          )}
+          {!selected && <button className="btn btn-sm btn-primary" onClick={openNew}>+ 添加对标账号</button>}
+          {selected && detail && (
+            <>
+              {(() => {
+                // 判定以「有没有数据」为准，而不是 detail_fetched：早先版本会在没读到
+                // 数据时也标完成，那些残留标记不能让它永远不再被深挖（后端同样自愈）。
+                const pending = detail.works.filter((w) => w.id && !(
+                  w.detail_fetched && (w.favorites !== null || w.comments !== null))).length;
+                if (pending === 0) return null;
+                const mins = Math.max(1, Math.round(pending * 7 / 60));   // 纯 HTTP：每条约 0.5s + 6s 间隔
+                return (
+                  <button className="btn btn-sm" onClick={deepDiveBatch}
+                    disabled={detail.account.running || detail.fetch?.state === 'running'}
+                    title={`逐条读取收藏/评论（纯 HTTP，不用浏览器）：每条约 6 秒，共 ${pending} 条约 ${mins} 分钟。` +
+                           `串行不并发；命中平台风控会立即停止，已完成的部分会保留。`}>
+                    ⟳ 补齐收藏/评论（{pending} 条{pending > 1 ? `，约 ${mins} 分钟` : ''}）
+                  </button>
+                );
+              })()}
+              {detail.account.platform === 'xiaohongshu' && (
+                <label className="bench-budget"
+                  title="刷新时同步本地素材：没下载过的补下素材（图文约 1～17MB；视频按最低画质，约 5～35MB），已下载的只更新点赞/收藏/评论">
+                  同步下载
+                  <select value={syncBudget} onChange={(e) => setSyncBudget(Number(e.target.value))}>
+                    <option value={0}>不下（只更新数据）</option>
+                    <option value={5}>最多 5 条</option>
+                    <option value={10}>最多 10 条</option>
+                    <option value={20}>最多 20 条</option>
+                    <option value={999}>全部补齐</option>
+                  </select>
+                </label>
+              )}
+              <button className="btn btn-sm btn-primary"
+                onClick={() => refresh(detail.account)}
+                disabled={detail.account.running || (detail.cooldown_left ?? 0) > 0}
+                title="重新抓主页列表，并同步本地素材：没下载过的下载素材，下载过的只更新点赞/收藏/评论">
+                {detail.account.running
+                  ? '抓取中…'
+                  : (detail.cooldown_left ?? 0) > 0 ? `冷却 ${detail.cooldown_left}s` : '⟳ 获取最新作品（含同步）'}
+              </button>
+            </>
+          )}
+        </div>
+      </div>
+
+      {err && <div className="bench-err">{err}</div>}
+
+      {/* ---------------- 列表视图 ---------------- */}
+      {!selected && (
+        <>
+          {accounts.length === 0 && (
+            <div className="card bench-empty">
+              <div style={{ fontSize: 30 }}>🎯</div>
+              <h3 style={{ margin: '10px 0 6px' }}>还没有对标账号</h3>
+              <p style={{ color: 'var(--text-secondary)', fontSize: 13, lineHeight: 1.7, margin: 0 }}>
+                {autoPlatforms.length > 0
+                  ? `当前可自动抓取：${autoPlatforms.map((p) => p.name).join('、')}。`
+                  : '当前没有可自动抓取的平台，可先手动登记账号。'}<br />
+                添加后会自动抓一次，之后随时点「获取最新作品」更新。
+              </p>
+              <button className="btn btn-sm btn-primary" style={{ marginTop: 14 }} onClick={openNew}>
+                + 添加对标账号
+              </button>
+            </div>
+          )}
+
+          {accounts.length > 0 && (
+            <div className="panel bench-table-wrap">
+              <table className="bench-table">
+                <thead>
+                  <tr>
+                    <th>平台</th>
+                    <th>账号</th>
+                    <th className="num">粉丝</th>
+                    <th className="num">累计获赞</th>
+                    <th className="num">累计收藏</th>
+                    <th className="num">累计评论</th>
+                    <th className="num">作品</th>
+                    <th>最近更新</th>
+                    <th />
+                  </tr>
+                </thead>
+                <tbody>
+                  {accounts.map((a) => {
+                    const meta = platMeta[a.platform];
+                    const st = a.fetch?.state || (a.running ? 'running' : 'idle');
+                    return (
+                      <tr key={a.id} className="bench-row" onClick={() => setSelected(a.id)}>
+                        <td><span className="badge">{a.platform_name || meta?.name || a.platform}</span></td>
+                        <td>
+                          <div className="bench-name">
+                            {a.nickname || <span className="bench-muted">（未抓取）</span>}
+                            {meta?.experimental && <span className="bench-tag warn">未实测</span>}
+                          </div>
+                          <div className="bench-sub">{a.account_id}{a.remark ? ` · ${a.remark}` : ''}</div>
+                        </td>
+                        <td className="num">{metricText(a.followers)}</td>
+                        <td className="num">{metricText(a.likes)}</td>
+                        <td className="num">{metricText(a.favorites)}</td>
+                        <td className="num">{metricText(a.comments)}</td>
+                        <td className="num">{a.work_count || '—'}</td>
+                        <td>
+                          <div className="bench-sub">
+                            {st === 'running' ? '抓取中…' : a.fetched_at ? timeAgo(a.fetched_at * 1000) : '未抓取'}
+                          </div>
+                          {st === 'risk' && <div className="bench-tag danger">风控熔断</div>}
+                          {st === 'error' && <div className="bench-tag danger" title={a.last_error}>失败</div>}
+                          {a.status === 'manual' && <div className="bench-tag">手动登记</div>}
+                          {a.logged_in === false && <div className="bench-tag warn" title="登录态未生效，部分字段平台只给占位值">登录态失效</div>}
+                        </td>
+                        <td className="bench-actions" onClick={(e) => e.stopPropagation()}>
+                          {meta?.auto && (() => {
+                            const cd = cooldownLeft(a);
+                            const running = a.running || a.fetch?.state === 'running';
+                            return (
+                              <button
+                                className="bench-refresh"
+                                disabled={running || cd > 0}
+                                title={cd > 0
+                                  ? `冷却中：读操作也会触发平台风控，约 ${cd} 秒后可再抓`
+                                  : '获取该账号的最新作品'}
+                                onClick={() => refresh(a)}
+                              >
+                                {running ? '抓取中…' : cd > 0 ? `冷却 ${cd}s` : '⟳ 刷新'}
+                              </button>
+                            );
+                          })()}
+                          <button className="session-act danger" title="删除" onClick={() => remove(a)}>
+                            <IconTrash size={13} />
+                          </button>
+                          <IconChevron size={13} />
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          {autoPlatforms.length > 0 && (
+            <p className="bench-foot">
+              抓取走平台公开信息、串行节流（同一账号两次抓取至少间隔 5 分钟）；
+              命中平台风控会立即停止而<strong>不重试</strong>——重试会把软限流升级成数小时封禁。
+            </p>
+          )}
+        </>
+      )}
+
+      {/* ---------------- 详情视图 ---------------- */}
+      {selected && detail && (
+        <>
+          <div className="card bench-profile">
+            <div className="bench-profile-main">
+              <div className="bench-profile-name">
+                {detail.account.nickname || detail.account.account_id}
+                {detail.platform && (detail.platform as BenchPlatform).experimental && (
+                  <span className="bench-tag warn">未实测路径</span>
+                )}
+              </div>
+              {detail.account.bio && <div className="bench-sub">{detail.account.bio}</div>}
+              <div className="bench-profile-meta">
+                <span>{(detail.platform as BenchPlatform)?.name || detail.account.platform_name}</span>
+                <span className="bench-dot">·</span>
+                <span>{detail.account.account_id}</span>
+                {detail.account.home_url && (
+                  <>
+                    <span className="bench-dot">·</span>
+                    <a href={detail.account.home_url} target="_blank" rel="noreferrer">打开主页 ↗</a>
+                  </>
+                )}
+                <span className="bench-dot">·</span>
+                <button className="bench-act" onClick={() => {
+                  const top = [...detail.works].sort((a, b) => (b.likes ?? 0) - (a.likes ?? 0)).slice(0, 5);
+                  const brief = top.map((w, i) => `${i + 1}. ${w.title}（点赞 ${w.likes ?? '—'}）`).join('\n');
+                  onAskAgent(
+                    `这是我关注的对标账号「${detail.account.nickname || detail.account.account_id}」`
+                    + `（${detail.account.platform_name}，粉丝 ${metricText(detail.account.followers)}）。\n`
+                    + `它近期点赞最高的几条内容：\n${brief || '（暂无作品数据，请先抓取）'}\n\n`
+                    + `请按竞品拆解的方法论分析：选题分布、格式偏好、爆款规律，`
+                    + `并给出我（当前画像）可以差异化跟进的方向。数据来自公开主页，`
+                    + `平台不公开的字段请如实标注，不要编造。`);
+                }}><IconChat size={12} /> 让 Agent 分析</button>
+              </div>
+            </div>
+            <div className="bench-profile-stats">
+              {([['粉丝', detail.account.followers], ['累计获赞', detail.account.likes],
+                 ['累计收藏', detail.account.favorites], ['累计评论', detail.account.comments]] as const).map(
+                ([label, m]) => (
+                  <div key={label} className="bench-stat">
+                    <div className="bench-stat-val">{metricText(m)}</div>
+                    <div className="bench-stat-label">{label}</div>
+                  </div>
+                ))}
+            </div>
+          </div>
+
+          {(detail.coverage || detail.source || detail.median_likes) && (
+            <div className="bench-note">
+              数据来源：{detail.source || '平台公开信息'}
+              {detail.coverage ? `（${detail.coverage}）` : ''}
+              {detail.fetched_at ? ` · 更新于 ${timeAgo(detail.fetched_at * 1000)}` : ''}
+              {detail.median_likes ? ` · 本账号点赞中位数 ${fmtNum(detail.median_likes)}（爆款线 = 中位数 × 3）` : ''}
+            </div>
+          )}
+
+          {(detail.account.warnings || []).map((w, i) => (
+            <div key={i} className={`bench-note ${/游客态|登录态/.test(w) ? 'alert' : 'dim'}`}>{w}</div>
+          ))}
+
+          {detail.account.logged_in === false && (
+            <div className="bench-err">
+              <strong>小红书 cookie 已失效或被平台降级（当前被判游客态）</strong>：粉丝数只给「1万+」这类
+              占位值（已留空，不显示错的数字），作品列表也拿不到作品 ID（无原文链接、无法深挖）。
+              累计获赞/收藏来自精确字段，仍然有效。
+              <br />
+              处理办法：在自己浏览器里登录小红书 → 复制新的 Cookie →
+              点本页右上角「🔑 Cookie」粘贴保存，再点「获取最新作品」。
+              若短时间请求偏多，平台会把会话降级数小时，等一会再试即可（本工具不绕过平台风控）。
+            </div>
+          )}
+
+          {detail.account.degraded && (
+            <div className="bench-note alert">
+              本次抓取被判游客态，已<strong>保留上次抓到的作品列表</strong>（含作品 ID），没有被空数据覆盖。
+            </div>
+          )}
+
+          {detail.fetch?.state === 'risk' && (
+            <div className="bench-err">平台风控熔断：{detail.fetch.message || '已停止，请数小时后再试'}</div>
+          )}
+          {(detail.account.running || detail.fetch?.state === 'running') && detail.fetch?.message && (
+            <div className="bench-note">{detail.fetch.message}</div>
+          )}
+          {/* 完成后也留一行汇总（含「还有 N 条未下载」这种要跟进的信息），而不是一闪而过 */}
+          {!detail.account.running && detail.fetch?.state === 'done' && detail.fetch?.message && (
+            <div className="bench-note dim">{detail.fetch.message}</div>
+          )}
+          {detail.account.last_error && detail.fetch?.state !== 'risk' && (
+            <div className="bench-err">上次抓取失败：{detail.account.last_error}</div>
+          )}
+
+          <div className="bench-works-head">
+            <span className="panel-title" style={{ margin: 0 }}>
+              最新作品 {detail.works.length > 0 && `（${detail.works.length} 条）`}
+            </span>
+            {detail.works.length > 10 && (
+              <button className="dash-more" onClick={() => setShowAllWorks((v) => !v)}>
+                {showAllWorks ? '只看最新 10 条' : `显示全部 ${detail.works.length} 条`}
+              </button>
+            )}
+          </div>
+
+          {detail.works.length === 0 && (
+            <div className="card bench-empty">
+              {detail.account.running || detail.fetch?.state === 'running'
+                ? '正在抓取…（首次约 30-60 秒）'
+                : '还没有作品数据。点右上角「获取最新作品」抓一次。'}
+            </div>
+          )}
+
+          <div className="bench-grid">
+            {(showAllWorks ? detail.works : detail.works.slice(0, 10)).map((w, i) => {
+              const f = (detail.platform as BenchPlatform)?.fields || {};
+              return (
+                <article key={w.id || `${i}-${w.title}`} className={`card bench-work${w.is_burst ? ' burst' : ''}`}>
+                  <div className="bench-work-cover">
+                    {w.cover_path ? (
+                      <img src={mediaUrl(w.cover_path)} alt="" loading="lazy" referrerPolicy="no-referrer" />
+                    ) : w.cover_url ? (
+                      <img src={w.cover_url} alt="" loading="lazy" referrerPolicy="no-referrer" />
+                    ) : (
+                      <span className="bench-work-ph">📝</span>
+                    )}
+                    {w.is_burst && <span className="bench-burst">爆款</span>}
+                    {w.is_top && <span className="bench-top">置顶</span>}
+                  </div>
+                  <div className="bench-work-body">
+                    <div className="bench-work-title" title={w.title}>{w.title}</div>
+                    <div className="bench-work-time">{timeAgo(w.published_at_ms)}</div>
+                    <div className="bench-work-stats">
+                      {w.plays !== null && w.plays !== undefined && (
+                        <span title="播放量">▶ {fmtNum(w.plays)}</span>
+                      )}
+                      <span title="点赞">👍 {fmtNum(w.likes)}</span>
+                      <span title={f.work_favorites ? '收藏' : '该平台不公开收藏数'}>⭐ {fmtNum(w.favorites)}</span>
+                      <span title={f.work_comments ? '评论' : '该平台不公开评论数'}>💬 {fmtNum(w.comments)}</span>
+                    </div>
+                    <div className="bench-work-actions">
+                      {w.url && <a className="bench-act" href={w.url} target="_blank" rel="noreferrer">原文 ↗</a>}
+                      {onBreakdown && (
+                        <button className="bench-act" onClick={() => onBreakdown(
+                          `${w.title}\n（来源：${detail.account.nickname || detail.account.account_id} · `
+                          + `${detail.account.platform_name} · 点赞 ${w.likes ?? '—'}）`)}>拆解</button>
+                      )}
+                      <button className="bench-act" onClick={() => toIdeas(w, detail.account)}>
+                        <IconIdea size={12} /> 存选题
+                      </button>
+                      {w.detail_available && !w.detail_fetched && (
+                        <button className="bench-act" onClick={() => deepDive(w)}>深挖</button>
+                      )}
+                      {/* 小红书：把这条笔记的全部数据下下来（图片原图/动图 + 视频，默认 1080p） */}
+                      {detail.account.platform === 'xiaohongshu' && w.id && (
+                        w.downloaded && w.download ? (
+                          <a className="bench-act" target="_blank" rel="noreferrer"
+                            href={mediaUrl(w.download.note_md)}
+                            title={`已下载 ${w.download.files} 个文件（${(w.download.bytes / 1048576).toFixed(1)}MB）`
+                              + ` · 打开笔记记录（含正文/标签/互动数据）`}>
+                            ✓ 已下载 {w.download.files}
+                          </a>
+                        ) : (
+                          <button className="bench-act" disabled={w.downloading || busyWork === w.id}
+                            title="下载这条笔记的全部数据：图片原图（含动图）+ 视频（默认最低画质，省磁盘）+ 元数据记录"
+                            onClick={() => downloadWork(w)}>
+                            {w.downloading || busyWork === w.id ? '下载中…' : '⬇ 下载'}
+                          </button>
+                        )
+                      )}
+                    </div>
+                  </div>
+                </article>
+              );
+            })}
+          </div>
+
+          {detail.works.length > 0 && !(detail.platform as BenchPlatform)?.fields?.work_favorites
+            && !(detail.platform as BenchPlatform)?.fields?.work_comments && (
+            <p className="bench-foot">
+              {(detail.platform as BenchPlatform)?.name} 的作品收藏/评论数不在公开主页里
+              （需要作者后台，或逐条详情页——而该平台不返回作品 ID，因此无法深挖），所以显示「—」。
+            </p>
+          )}
+        </>
+      )}
+
+      {selected && !detail && (
+        <div className="loading" style={{ padding: 40 }}><div className="spinner" />加载中…</div>
+      )}
+
+      {cookieForm && (
+        <CookieModal initialPlatform={cookieForm.platform}
+          onClose={() => setCookieForm(null)}
+          onSaved={async () => {
+            setCookieForm(null);
+            setCookies(await fetchBenchCookies());
+            showToast('cookie 已保存——之后该平台走纯 HTTP，不用浏览器');
+          }} />
+      )}
+
+      {/* ---------------- 新增弹窗 ---------------- */}
+      {form && (
+        <div className="overlay" onClick={() => setForm(null)}>
+          <div className="modal" style={{ width: 460, maxWidth: '100%' }} onClick={(e) => e.stopPropagation()}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <h3 style={{ margin: 0 }}>添加对标账号</h3>
+              <button className="icon-btn" onClick={() => setForm(null)}>×</button>
+            </div>
+
+            <label className="field-label">平台</label>
+            <div style={{ display: 'flex', gap: 7, flexWrap: 'wrap' }}>
+              {platforms.map((p) => (
+                <button key={p.platform} className={`chip ${form.platform === p.platform ? 'active' : ''}`}
+                  onClick={() => setForm({ ...form, platform: p.platform })}>
+                  {p.name}
+                  {p.auto && p.experimental && <span className="chip-exp">未实测</span>}
+                  {!p.auto && <span className="chip-exp dim">手动</span>}
+                </button>
+              ))}
+            </div>
+
+            <label className="field-label">
+              {platMeta[form.platform]?.id_label || '账号 ID'}
+            </label>
+            <input className="field" value={form.target} autoFocus
+              placeholder={platMeta[form.platform]?.id_hint || '主页链接或账号 ID'}
+              onChange={(e) => setForm({ ...form, target: e.target.value })} />
+
+            <label className="field-label">备注</label>
+            <input className="field" value={form.remark} placeholder="如：同赛道头部，重点看选题"
+              onChange={(e) => setForm({ ...form, remark: e.target.value })} />
+
+            {platMeta[form.platform] && (
+              <div className={`bench-hint ${platMeta[form.platform].auto ? '' : 'warn'}`}>
+                {platMeta[form.platform].auto
+                  ? <>可自动抓取：{platMeta[form.platform].note}</>
+                  : <>暂不支持自动抓取，只能手动登记账号信息：{platMeta[form.platform].note}</>}
+              </div>
+            )}
+            {manualPlatforms.length > 0 && (
+              <div className="bench-hint dim">
+                已支持自动抓取：{autoPlatforms.map((p) => p.name).join('、') || '（暂无）'}
+              </div>
+            )}
+
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 16 }}>
+              <button className="btn btn-sm" onClick={() => setForm(null)}>取消</button>
+              <button className="btn btn-sm btn-primary" onClick={submit}
+                disabled={busy || !form.target.trim()}>{busy ? '添加中…' : '添加'}</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {toast && <div className="toast ok"><span className="toast-icon">✓</span>{toast}</div>}    </div>
+  );
+}

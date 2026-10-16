@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import re
 import sys
@@ -114,13 +115,441 @@ class Throttle:
 
 
 def _initial_state(html: str) -> dict | None:
-    m = re.search(r"window\.__INITIAL_STATE__\s*=\s*(\{.*?\})\s*</script>", html, re.S)
+    """从 SSR HTML 里取出 ``window.__INITIAL_STATE__``。
+
+    不能用「非贪婪匹配到 ``</script>``」那种写法：笔记页的 state 有 4.7 万字符，
+    只要**字符串值里出现 ``</script>``**（笔记正文常见），正则就会在那里截断、
+    JSON 解析失败 → 整页数据被判成「没有」——正是详情页拿不到 interactInfo 的原因。
+    这里用 ``raw_decode``：它按 JSON 语法走，字符串里的括号/标签都不会干扰。
+    """
+    m = re.search(r"window\.__INITIAL_STATE__\s*=\s*", html)
     if not m:
         return None
+    text = html[m.end():]
+    # 只把**裸的** undefined 换成 null，别动字符串里的 "undefined"（仓库既有测试盯着这点）
+    serialized = re.sub(
+        r'"(?:\\.|[^"\\])*"|\bundefined\b',
+        lambda token: "null" if token.group() == "undefined" else token.group(),
+        text)
     try:
-        return json.loads(m.group(1).replace("undefined", "null"))
-    except json.JSONDecodeError:
+        state, _end = json.JSONDecoder().raw_decode(serialized)
+    except ValueError:
         return None
+    return state if isinstance(state, dict) else None
+
+
+def _state_from_html(html: str) -> dict:
+    """从 SSR HTML 里取 ``window.__INITIAL_STATE__``（YAML 解析，容 JS 语法）。
+
+    用 YAML 而不是 JSON：state 里带 ``new Map([])`` 这类非 JSON 语法，
+    JSON 解析器会直接失败（这正是本仓库此前读不到详情数据的原因）。
+    做法参考 XHS-Downloader 项目。
+    """
+    if not html:
+        return {}
+    from lxml.etree import HTML
+    from yaml import safe_load
+
+    scripts = HTML(html).xpath("//script/text()")
+    scripts.reverse()          # 页面前面还有别的脚本体，真身是最后一段
+    raw = next((s for s in scripts if s.startswith("window.__INITIAL_STATE__")), "")
+    if not raw:
+        return {}
+    cleaned = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "",
+                     raw.lstrip("window.__INITIAL_STATE__="))
+    cleaned = cleaned.replace("new Map([])", "[]").replace("undefined", "null")
+    try:
+        state = safe_load(cleaned)
+    except Exception:  # noqa: BLE001 - 结构变化时不猜
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
+def _http_get(url: str, cookie: str = "", *, impersonate: str = "chrome", timeout: int = 20):
+    """带 TLS 指纹伪装的 HTTP GET。
+
+    普通 HTTP 客户端（requests/urllib）以及 Playwright 无头内核都会被小红书判 300012；
+    curl_cffi 伪装真实 Chrome 指纹后反而最稳（做法参考 XHS-Downloader）。
+    """
+    from curl_cffi import requests as creq
+
+    headers = {
+        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                  "image/avif,image/webp,image/apng,*/*;q=0.8",
+        "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "referer": "https://www.xiaohongshu.com/",
+    }
+    return creq.get(url, headers=headers, cookies=parse_cookie(cookie) if cookie else None,
+                    timeout=timeout, verify=False, allow_redirects=True, impersonate=impersonate)
+
+
+def parse_cookie(cookie: str) -> dict:
+    """把浏览器里复制出来的 cookie 串解析成 dict（容忍换行/多余分号）。"""
+    jar: dict[str, str] = {}
+    for part in re.split(r"[;\n]", cookie or ""):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        name, _, value = part.partition("=")
+        name = name.strip()
+        if name:
+            jar[name] = value.strip()
+    return jar
+
+
+def fetch_profile_http(user_id: str, cookie: str, *, impersonate: str = "chrome",
+                       timeout: int = 20) -> dict:
+    """纯 HTTP 读主页（**带 cookie 才有真实数据**）——不用浏览器。
+
+    实测对比（同账号）：
+    - 不带 cookie：``loggedIn=False``、粉丝/互动是「1万+」占位值、作品**没有 ID**
+    - 带真实 ``web_session``：``loggedIn=True``、粉丝精确值、作品 **ID 齐全**（还多 2 条）
+
+    返回结构与 ``fetch()`` 一致（``profile`` / ``notes``），便于上层复用同一套解析。
+    """
+    url = f"https://www.xiaohongshu.com/user/profile/{user_id}"
+    response = _http_get(url, cookie, impersonate=impersonate, timeout=timeout)
+    if response.status_code != 200:
+        raise RuntimeError(f"主页 HTTP {response.status_code}")
+    state = _state_from_html(response.text)
+    if not state:
+        raise RuntimeError("主页 SSR 解析失败（可能被风控或页面改版）")
+    user = state.get("user") or {}
+    page = user.get("userPageData") or {}
+    basic = page.get("basicInfo") or {}
+
+    def interaction(kind: str):
+        for item in page.get("interactions") or []:
+            if isinstance(item, dict) and item.get("type") == kind:
+                return item.get("count")
+        return None
+
+    notes: list[dict] = []
+    for group in user.get("notes") or []:
+        if not isinstance(group, list):
+            continue
+        for entry in group:
+            note = _normalize_note(entry)
+            if note is not None:
+                notes.append(note)
+    profile = {
+        "logged_in_per_ssr": bool(user.get("loggedIn")),
+        "guest": bool((user.get("userInfo") or {}).get("guest")),
+        "nickname": basic.get("nickname") or "",
+        "red_id": basic.get("redId") or "",
+        "desc": basic.get("desc") or "",
+        "ip_location": basic.get("ipLocation") or "",
+        "fans_raw": interaction("fans"),
+        "interaction_raw": interaction("interaction"),
+        "fans_num": _count_number(interaction("fans")),
+        "liked_exact": page.get("liked"),
+        "collected_exact": page.get("collected"),
+        "posted_exact": page.get("posted"),
+        "notes_in_ssr": len(notes),
+    }
+    return {"mode": "http+cookie", "profile": profile, "notes": notes,
+            "request_log": [f"[i] 纯 HTTP 读主页（带 cookie）：{len(notes)} 条作品"]}
+
+
+def fetch_note_detail(work_id: str, xsec_token: str = "", *, cookie: str = "",
+                      impersonate: str = "chrome", timeout: int = 20,
+                      referer: str = "https://www.xiaohongshu.com/") -> dict:
+    """纯 HTTP 读单条笔记的互动数据（点赞/收藏/评论/分享）——**不用浏览器、不用登录**。
+
+    做法参考 XHS-Downloader（JoeanAmier）：
+    1. ``curl_cffi`` + ``impersonate`` 伪装真实 Chrome 的 TLS 指纹 —— 这是关键，
+       普通 HTTP 客户端（requests/urllib）的指纹会被小红书判风险（300012），
+       而 Playwright 无头内核同样会被判；伪装指纹的纯 HTTP 反而最稳、最快。
+    2. lxml 取出 ``window.__INITIAL_STATE__`` 那段脚本（取**最后**一段，页面前面还有别的）。
+    3. **用 YAML 解析**：state 里带 ``new Map([])`` 这种非 JSON 语法，JSON 解析器会直接失败
+       （这是本仓库此前读不到详情数据的直接原因）；替换成 ``[]`` 后 YAML 能正常解析。
+    4. 详情在 ``note.noteDetailMap[-1].note.interactInfo``（顶层 ``note``，
+       不是 ``AiNoteDetailStore`` —— 后者是空的 ``new Map([])``）。
+
+    返回 ``{"liked","collected","comment","share","title","author","note_id"}``，
+    数值已按「1.3万」这类展示串解析成整数；拿不到就返回空 dict（不编造）。
+    """
+    url = f"https://www.xiaohongshu.com/explore/{work_id}"
+    if xsec_token:
+        url += f"?xsec_token={xsec_token}&xsec_source=pc_user"
+    response = _http_get(url, cookie, impersonate=impersonate, timeout=timeout)
+    if response.status_code != 200:
+        raise RuntimeError(f"笔记页 HTTP {response.status_code}")
+    state = _state_from_html(response.text)
+    detail_map = ((state.get("note") or {}).get("noteDetailMap") or {})
+    if not isinstance(detail_map, dict) or not detail_map:
+        return {}
+    note = (list(detail_map.values())[-1] or {}).get("note") or {}
+    info = note.get("interactInfo") or {}
+    out = {
+        "note_id": note.get("noteId") or work_id,
+        "title": note.get("title") or "",
+        "author": ((note.get("user") or {}).get("nickname")) or "",
+        "liked": _count_number(info.get("likedCount")),
+        "collected": _count_number(info.get("collectedCount")),
+        "comment": _count_number(info.get("commentCount")),
+        "share": _count_number(info.get("shareCount")),
+    }
+    return out if any(out[k] is not None for k in ("liked", "collected", "comment")) else {}
+
+
+def _signed_api_get(endpoint: str, params: dict, cookie: str, *, timeout: int = 25,
+                    referer: str = "https://www.xiaohongshu.com/"):
+    """调 ``edith.xiaohongshu.com`` 的签名接口（xhshow 生成 x-s / x-s-common）。
+
+    ⚠️ 必须用 ``Xhshow().build_url()`` 生成 URL：签名覆盖查询串，
+    自己 urlencode 拼出来的参数顺序与库内部不一致时会 406（实测踩过）。
+    """
+    from curl_cffi import requests as creq
+    from xhshow import Xhshow
+
+    jar = parse_cookie(cookie)
+    signer = Xhshow()
+    url = signer.build_url(endpoint, params)
+    headers = signer.sign_headers_get(uri=endpoint, cookies=jar, params=params) | {
+        "accept": "application/json, text/plain, */*",
+        "accept-language": "zh-CN",
+        "origin": "https://www.xiaohongshu.com",
+        "referer": referer,
+        "sec-fetch-dest": "empty", "sec-fetch-mode": "cors", "sec-fetch-site": "same-site",
+        "user-agent": UA,
+    }
+    return creq.get(url, headers=headers, cookies=jar, timeout=timeout, verify=False,
+                    allow_redirects=True, impersonate="chrome")
+
+
+def fetch_otherinfo(user_id: str, cookie: str) -> dict:
+    """签名接口读账号指标（昵称/头像/粉丝/获赞/收藏/作品数）。
+
+    为什么不用主页 SSR：**带 cookie 时小红书返回的是登录态 SPA 壳页**
+    （实测 10KB、没有 ``__INITIAL_STATE__``），游客态才有完整 SSR。
+    所以带 cookie 的取数必须走接口，指标也一样。
+    """
+    endpoint = "https://edith.xiaohongshu.com/api/sns/web/v1/user/otherinfo"
+    params = {"target_user_id": user_id}
+    response = _signed_api_get(endpoint, params, cookie,
+                              referer=f"https://www.xiaohongshu.com/user/profile/{user_id}")
+    if response.status_code != 200:
+        raise RuntimeError(f"账号信息接口 HTTP {response.status_code}")
+    body = response.json()
+    data = body.get("data") or {}
+    basic = data.get("basic_info") or data.get("basicInfo") or {}
+    inter = {i.get("type"): i.get("count") for i in (data.get("interactions") or [])
+             if isinstance(i, dict)}
+    return {
+        "nickname": basic.get("nickname") or "",
+        "red_id": basic.get("red_id") or basic.get("redId") or "",
+        "desc": basic.get("desc") or "",
+        "avatar": basic.get("imageb") or basic.get("images") or basic.get("image") or "",
+        "fans_raw": inter.get("fans"),
+        "follows_raw": inter.get("follows"),
+        "liked_exact": data.get("liked"),
+        "collected_exact": data.get("collected"),
+        "posted_exact": data.get("posted"),
+    }
+
+
+def fetch_profile_api(user_id: str, cookie: str, *, limit: int = 50,
+                      threshold: tuple[float, float] = (STEADY_MIN, STEADY_MAX),
+                      verbose: bool = False) -> dict:
+    """带 cookie 的完整取数：**指标走 otherinfo 接口 + 作品走 user_posted 分页接口**。
+
+    主页 SSR 在登录态下是空壳，这条路（本函数）才是带 cookie 时的正路。
+    列表接口被限流（实测 ``HTTP 461``）时**退回游客 SSR 拿一批**并如实告警——
+    游客 SSR 不带 cookie 才有数据，所以退回时显式去掉 cookie。
+    """
+    log: list[str] = []
+    warnings: list[str] = []
+    notes: list[dict] = []
+    pages = 0
+    listed_via_api = False
+    try:
+        info = fetch_otherinfo(user_id, cookie)
+        log.append(f"[i] 账号指标（otherinfo）：粉丝 {info.get('fans_raw')}，"
+                   f"获赞 {info.get('liked_exact')}，收藏 {info.get('collected_exact')}，"
+                   f"作品 {info.get('posted_exact')}")
+    except Exception as error:  # noqa: BLE001
+        info = {}
+        warnings.append(f"账号指标接口失败：{type(error).__name__}: {error}")
+    try:
+        paged = fetch_profile_paged(user_id, cookie, limit=limit, threshold=threshold,
+                                    verbose=verbose)
+        notes, pages = paged["notes"], paged["pages"]
+        listed_via_api = True
+        log += paged.get("request_log") or []
+        if paged.get("risk_control"):
+            warnings.append(f"列表接口命中风控信号：{paged['risk_control']}")
+    except Exception as error:  # noqa: BLE001
+        logger = f"[!] 作品列表接口不可用（{type(error).__name__}: {error}）"
+        log.append(logger)
+        # 退回游客 SSR：显式不带 cookie，因为带 cookie 时主页是空壳
+        try:
+            guest = fetch_profile_http(user_id, "")
+            notes = guest.get("notes") or []
+            warnings.append("作品列表接口暂时被平台限流，本次用游客列表（有标题/封面/点赞，"
+                            "但没有作品 ID：无原文链接、无法深挖）；稍后重试即可恢复")
+            log.append(f"[i] 游客 SSR 退回成功：{len(notes)} 条")
+        except Exception as guest_error:  # noqa: BLE001
+            warnings.append(f"退回游客列表也失败：{type(guest_error).__name__}: {guest_error}")
+    profile = {
+        "logged_in_per_ssr": bool(info),          # 指标接口能返回即说明会话有效
+        "guest": False,
+        "nickname": info.get("nickname") or "",
+        "red_id": info.get("red_id") or "",
+        "desc": info.get("desc") or "",
+        "avatar": info.get("avatar") or "",
+        "fans_raw": info.get("fans_raw"),
+        "interaction_raw": None,
+        "fans_num": _count_number(info.get("fans_raw")),
+        "liked_exact": info.get("liked_exact"),
+        "collected_exact": info.get("collected_exact"),
+        "posted_exact": info.get("posted_exact"),
+        "notes_in_ssr": len(notes),
+    }
+    return {"mode": "http+api", "profile": profile, "notes": notes,
+            "paging": {"pages": pages} if (pages and listed_via_api) else {},
+            "warnings": warnings, "request_log": log}
+
+
+def fetch_profile_paged(user_id: str, cookie: str, *, limit: int = 0,
+                        threshold: tuple[float, float] = (STEADY_MIN, STEADY_MAX),
+                        verbose: bool = False, max_pages: int = 40) -> dict:
+    """纯 HTTP **翻页**读主页全部作品（走签名接口 ``user_posted``）。
+
+    主页 SSR 一次只给 30 条；要拿全量必须调分页接口，而该接口需要 ``x-s``/``x-s-common``
+    签名头。这里用 ``xhshow`` 生成签名（第三方纯算库），仍然**不用浏览器**。
+
+    ⚠️ 两个实测坑（都踩过、都已解决）：
+    1. 请求 URL 必须用 ``Xhshow().build_url()`` 生成——签名覆盖查询串，
+       自己 ``urlencode`` 拼出来的参数顺序与库内部不一致时会 406。
+    2. ``xsec_token``/``xsec_source`` 传空串即可（浏览器真实请求里就是空的）。
+    """
+    from curl_cffi import requests as creq
+    from xhshow import Xhshow
+
+    jar = parse_cookie(cookie)
+    if not jar:
+        raise RuntimeError("cookie 为空，无法调用签名接口")
+    signer = Xhshow()
+    endpoint = "https://edith.xiaohongshu.com/api/sns/web/v1/user_posted"
+    common_headers = {
+        "accept": "application/json, text/plain, */*",
+        "accept-language": "zh-CN",
+        "origin": "https://www.xiaohongshu.com",
+        "referer": "https://www.xiaohongshu.com/",
+        "sec-fetch-dest": "empty", "sec-fetch-mode": "cors", "sec-fetch-site": "same-site",
+        "user-agent": UA,
+    }
+    throttle = Throttle(*threshold)
+    notes: list[dict] = []
+    seen: set[str] = set()
+    cursor = ""
+    log: list[str] = []
+    risk: str | None = None
+    pages = 0
+    while pages < max_pages:
+        params = {"num": 30, "cursor": cursor, "user_id": user_id,
+                  "image_formats": "jpg,webp,avif", "xsec_token": "", "xsec_source": ""}
+        url = signer.build_url(endpoint, params)      # 必须用库的 URL：签名覆盖查询串
+        headers = signer.sign_headers_get(uri=endpoint, cookies=jar, params=params)
+        response = creq.get(url, headers=headers | common_headers, cookies=jar, timeout=25,
+                            verify=False, allow_redirects=True, impersonate="chrome")
+        pages += 1
+        if response.status_code != 200:
+            raise RuntimeError(f"分页接口 HTTP {response.status_code}（第 {pages} 页）")
+        body = response.json()
+        if _risk_hit(response.text):
+            risk = str(_risk_hit(response.text))
+            log.append(f"[!] 第 {pages} 页命中风控信号：{risk} —— 已停止，不重试")
+            break
+        if not body.get("success"):
+            raise RuntimeError(f"分页接口返回失败：code={body.get('code')} msg={body.get('msg')}")
+        data = body.get("data") or {}
+        for item in data.get("notes") or []:
+            note = _normalize_note(item)
+            if note is None or note["note_id"] in seen:
+                continue
+            seen.add(note["note_id"])
+            notes.append(note)
+        log.append(f"[i] 第 {pages} 页：本页 {len(data.get('notes') or [])} 条，累计 {len(notes)} 条")
+        if verbose:
+            print(log[-1])
+        if limit and len(notes) >= limit:
+            notes = notes[:limit]
+            log.append(f"[i] 已达上限 {limit} 条，停止翻页")
+            break
+        if not data.get("has_more"):
+            log.append(f"[i] 平台报告 has_more=false：公开作品已取完（{len(notes)} 条）")
+            break
+        cursor = str(data.get("cursor") or "")
+        if not cursor:
+            log.append("[i] 无下一页游标，停止翻页")
+            break
+        throttle.wait()
+    return {"mode": "http+paged", "notes": notes, "pages": pages,
+            "complete": not risk and pages < max_pages,
+            "request_log": log, "risk_control": risk}
+
+
+def _normalize_note(item: dict) -> dict | None:
+    """把两种形态的作品条目归一化。
+
+    - **分页接口**（``user_posted``）：字段在顶层且是蛇形 ——
+      ``note_id`` / ``display_title`` / ``interact_info.liked_count`` / ``cover.url_default``
+    - **主页 SSR**：包在 ``noteCard`` 里且是驼峰 ——
+      ``noteCard.noteId`` / ``displayTitle`` / ``interactInfo.likedCount`` / ``cover.infoList``
+
+    两种都要认，否则会出现"拿到了条目却全是空字段"（实测踩过）。
+    """
+    if not isinstance(item, dict):
+        return None
+    card = item.get("note_card") or item.get("noteCard") or item
+    if not isinstance(card, dict):
+        return None
+    note_id = str(item.get("note_id") or item.get("id") or card.get("noteId") or "")
+    title = card.get("display_title") or card.get("displayTitle") or card.get("title") or ""
+    info = card.get("interact_info") or card.get("interactInfo") or {}
+    liked = info.get("liked_count") if info.get("liked_count") is not None else info.get("likedCount")
+    cover = _cover_url(card)
+    # ⚠️ 没有 note_id 是**合法**情况：游客态下平台就是不给作品 ID（实测 32 条全为空）。
+    # 早先这里把「无 ID」当无效条目丢掉，导致游客态整批作品变成 0 条——只有真正的空壳才该丢。
+    if not note_id and not title and not cover and liked is None:
+        return None
+    return {
+        "note_id": note_id,
+        "title": title,
+        "type": card.get("type") or "",
+        "liked_count": liked,
+        "liked_count_num": _count_number(liked),
+        "sticky": bool(info.get("sticky")),
+        "time_ms": card.get("time") or item.get("time"),
+        "cover": cover,
+        "xsec_token": (item.get("xsec_token") or item.get("xsecToken")
+                       or card.get("xsecToken") or ""),
+    }
+
+
+def _browser_channel() -> str | None:
+    """有头模式的浏览器内核：本机 Chrome / Edge。
+
+    无头 Playwright Chromium 会被小红书判 300012（IP 风险限制），同一网络下有头正常，
+    所以默认走有头 + 本机真实内核。
+    """
+    if os.name != "nt":
+        return None
+    pf = Path(os.environ.get("PROGRAMFILES", r"C:\Program Files"))
+    pf86 = Path(os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)"))
+    local = Path(os.environ.get("LOCALAPPDATA", ""))
+    chrome = (pf / "Google" / "Chrome" / "Application" / "chrome.exe",
+              pf86 / "Google" / "Chrome" / "Application" / "chrome.exe",
+              local / "Google" / "Chrome" / "Application" / "chrome.exe")
+    if any(p.is_file() for p in chrome):
+        return "chrome"
+    edge = (pf / "Microsoft" / "Edge" / "Application" / "msedge.exe",
+            pf86 / "Microsoft" / "Edge" / "Application" / "msedge.exe")
+    if any(p.is_file() for p in edge):
+        return "msedge"
+    return None
 
 
 def _count_number(raw) -> int | None:
@@ -137,6 +566,32 @@ def _count_number(raw) -> int | None:
         return int(float(s) * mult)
     except ValueError:
         return None
+
+
+def _cover_url(card: dict) -> str:
+    """SSR noteCard.cover → 封面图 URL（优先 WB_DFT 默认图，回退第一张）。
+
+    实测结构（2026-10-16 抓包）::
+
+        cover: {"width": 1320, "url": "", "infoList": [
+            {"imageScene": "WB_PRV", "url": "http://sns-webpic-qc.xhscdn.com/…"},
+            {"imageScene": "WB_DFT", "url": "http://sns-webpic-qc.xhscdn.com/…"}]}
+
+    注意 ``cover.url`` 常为空、真实地址在 ``infoList``，且给的是 http（统一升 https）。
+    分页接口用的是蛇形同义字段（``info_list`` / ``image_scene`` / ``url_default``），一并认。
+    """
+    cover = card.get("cover") or card.get("cover_info") or {}
+    if not isinstance(cover, dict):
+        return ""
+    scene_urls = {}
+    for item in (cover.get("infoList") or cover.get("info_list") or []):
+        if isinstance(item, dict) and item.get("url"):
+            scene_urls[item.get("imageScene") or item.get("image_scene") or ""] = item["url"]
+    url = (scene_urls.get("WB_DFT") or cover.get("url") or cover.get("url_default")
+           or cover.get("urlDefault") or cover.get("url_pre") or cover.get("urlPre")
+           or next(iter(scene_urls.values()), ""))
+    url = str(url or "")
+    return "https://" + url[7:] if url.startswith("http://") else url
 
 
 def parse_profile(state: dict) -> dict:
@@ -165,11 +620,20 @@ def parse_profile(state: dict) -> dict:
                 "liked_count_num": _count_number(info.get("likedCount")),
                 "sticky": bool(info.get("sticky")),
                 "time_ms": card.get("time"),
+                "cover": _cover_url(card),
                 "xsec_token": entry.get("xsecToken") or card.get("xsecToken") or "",
             })
 
     return {
         "logged_in_per_ssr": user.get("loggedIn"),
+        # 游客态判定：登录态失效时 SSR 会给「骨架值」——粉丝与「获赞与收藏」
+        # 双双回落成 "1万+"（实测 2026-10-16：真实获赞+收藏 53.9 万也显示 1万+），
+        # 因此游客态下的展示串不可信，必须让调用方知道（详见 userInfo.guest）。
+        "guest": bool((user.get("userInfo") or {}).get("guest")),
+        # 精确值：与展示串无关，服务端一直给整数（游客态也给，且会随时间增长）
+        "liked_exact": page.get("liked"),
+        "collected_exact": page.get("collected"),
+        "posted_exact": page.get("posted"),
         "user_id": basic.get("redId") and page.get("basicInfo", {}).get("userId") or "",
         "nickname": basic.get("nickname") or "",
         "red_id": basic.get("redId") or "",
@@ -222,8 +686,12 @@ def _risk_in_url(url: str) -> str | None:
 
 
 def fetch(user_id: str, *, anonymous: bool, throttle: Throttle, limit: int,
-          details: int, verbose: bool) -> tuple[dict, list[str], str | None]:
-    """Return (result, log_lines, risk_reason)."""
+          details: int, verbose: bool, headless: bool = False) -> tuple[dict, list[str], str | None]:
+    """Return (result, log_lines, risk_reason).
+
+    ``headless`` 默认 **False（有头）**：无头内核会被小红书判 300012，
+    生产调用不要改成无头（``--headless`` 只留给离线自检/调试）。
+    """
     from playwright.sync_api import sync_playwright
 
     log: list[str] = []
@@ -237,7 +705,7 @@ def fetch(user_id: str, *, anonymous: bool, throttle: Throttle, limit: int,
         try:
             if anonymous:
                 browser = p.chromium.launch(
-                    headless=True, args=["--disable-blink-features=AutomationControlled"])
+                    headless=headless, args=["--disable-blink-features=AutomationControlled"])
                 ctx = browser.new_context(user_agent=UA, locale="zh-CN",
                                           viewport={"width": 1440, "height": 900})
                 ctx_kind = "anonymous"
@@ -245,16 +713,22 @@ def fetch(user_id: str, *, anonymous: bool, throttle: Throttle, limit: int,
                 profile = PROFILE_ROOT / PROFILE_NAME
                 if not profile.is_dir():
                     log.append(f"[!] 持久化 profile 不存在：{profile} —— 回退匿名")
-                    browser = p.chromium.launch(headless=True)
+                    browser = p.chromium.launch(headless=headless)
                     ctx = browser.new_context(user_agent=UA, locale="zh-CN",
                                               viewport={"width": 1440, "height": 900})
                     ctx_kind = "anonymous (profile missing)"
                 else:
-                    ctx = p.chromium.launch_persistent_context(
-                        str(profile), headless=True, user_agent=UA, locale="zh-CN",
+                    # 有头（本机 Chrome 内核）：无头 Playwright Chromium 会被小红书判 300012，
+                    # 同一网络下有头正常。生产调用一律走这里（--headless 仅留给离线自检）。
+                    launch_kwargs: dict = dict(
+                        headless=headless, user_agent=UA, locale="zh-CN",
                         timezone_id="Asia/Shanghai",
                         viewport={"width": 1440, "height": 900},
                         args=["--disable-blink-features=AutomationControlled"])
+                    channel = _browser_channel()
+                    if not headless and channel:
+                        launch_kwargs["channel"] = channel      # 退回本机 Chrome/Edge
+                    ctx = p.chromium.launch_persistent_context(str(profile), **launch_kwargs)
                     ctx_kind = "logged-in (persistent profile)"
 
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
@@ -358,7 +832,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--max-delay", type=float, default=STEADY_MAX,
                     help=f"请求间隔上限秒（默认 {STEADY_MAX:g}，Steady 档）")
     ap.add_argument("--anonymous", action="store_true", help="强制匿名")
+    ap.add_argument("--headless", action="store_true",
+                    help="无头模式（默认有头：无头内核会被小红书判 300012，仅供离线自检）")
     ap.add_argument("--no-fallback", action="store_true", help="登录态失败时不回退匿名")
+    ap.add_argument("--cookie-file", help="浏览器里复制出来的 cookie 文件；给了就走**纯 HTTP**（不用浏览器）")
     ap.add_argument("--json", dest="json_out", help="把结果写到该文件")
     ap.add_argument("-q", "--quiet", action="store_true")
     a = ap.parse_args(argv)
@@ -380,22 +857,54 @@ def main(argv: list[str] | None = None) -> int:
               + ("（Steady 档）" if (a.min_delay, a.max_delay) == (STEADY_MIN, STEADY_MAX) else ""))
     log: list[str] = []
 
-    result, run_log, risk = fetch(a.user_id, anonymous=a.anonymous, throttle=throttle,
-                                  limit=a.limit, details=a.details, verbose=not a.quiet)
-    log += run_log
+    cookie = ""
+    if a.cookie_file:
+        try:
+            cookie = Path(a.cookie_file).expanduser().read_text(encoding="utf-8").strip()
+        except OSError as error:
+            print(f"cookie 文件读不到：{error}", file=sys.stderr)
+            return 4
+        if not cookie:
+            print("cookie 文件是空的", file=sys.stderr)
+            return 4
 
-    # Fallback: logged-in produced nothing → try anonymous, as requested.
-    if (not a.anonymous and not a.no_fallback and risk is None
-            and not (result.get("notes"))):
-        log.append("[i] 登录态未取到作品 → 回退匿名方式")
-        result2, log2, risk2 = fetch(a.user_id, anonymous=True, throttle=throttle,
-                                     limit=a.limit, details=0, verbose=not a.quiet)
-        log += log2
-        if result2.get("notes"):
-            result2["fallback_used"] = True
-            result, risk = result2, risk2
-        else:
-            risk = risk2 or risk
+    if cookie:
+        # 有 cookie 就走纯 HTTP：不用浏览器、没有无头检测、不会 300012。
+        # 指标走 otherinfo 接口、作品走 user_posted 分页接口 —— 因为**带 cookie 时
+        # 主页 SSR 是登录态空壳**（实测 10KB、没有 __INITIAL_STATE__），读不到任何数据。
+        try:
+            result = fetch_profile_api(a.user_id, cookie, limit=max(int(a.limit or 50), 30),
+                                       threshold=(a.min_delay, a.max_delay),
+                                       verbose=not a.quiet)
+        except Exception as error:  # noqa: BLE001
+            print(f"ERROR: 纯 HTTP 取数失败：{type(error).__name__}: {error}", file=sys.stderr)
+            return 3
+        result["notes"] = (result.get("notes") or [])[:a.limit] if a.limit else result.get("notes") or []
+        result["limit"] = a.limit
+        result["complete"] = bool(result.get("notes"))
+        result["cookie_used"] = True
+        risk = None
+        log += result.get("request_log") or []
+        # 接口层的告警（如列表被限流后退回游客列表）要冒泡给上层，不能吞
+        extra_warnings = result.get("warnings") or []
+    else:
+        result, run_log, risk = fetch(a.user_id, anonymous=a.anonymous, throttle=throttle,
+                                      limit=a.limit, details=a.details, verbose=not a.quiet,
+                                      headless=a.headless)
+        log += run_log
+
+        # Fallback: logged-in produced nothing → try anonymous, as requested.
+        if (not a.anonymous and not a.no_fallback and risk is None
+                and not (result.get("notes"))):
+            log.append("[i] 登录态未取到作品 → 回退匿名方式")
+            result2, log2, risk2 = fetch(a.user_id, anonymous=True, throttle=throttle,
+                                         limit=a.limit, details=0, verbose=not a.quiet)
+            log += log2
+            if result2.get("notes"):
+                result2["fallback_used"] = True
+                result, risk = result2, risk2
+            else:
+                risk = risk2 or risk
 
     result["request_log"] = log
     result["throttle"] = throttle.describe()
@@ -412,9 +921,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  昵称     {prof.get('nickname')}  ({prof.get('red_id')})")
             print(f"  粉丝     {prof.get('fans_raw')}   获赞与收藏 {prof.get('interaction_raw')}")
             print(f"  模式     {result.get('mode')}")
-            print(f"  作品     SSR 内 {prof.get('notes_in_ssr')} 篇，"
-                  f"取用 {len(result.get('notes') or [])} 篇"
-                  f"（账号总数请以主页显示为准；翻页需签名头，本工具不支持）")
+            print(f"  作品     {len(result.get('notes') or [])} 篇"
+                  + (f"（分页 {result['paging']['pages']} 页；本项目最多取最新 50 条）"
+                     if result.get("paging") else
+                     f"（SSR 内 {prof.get('notes_in_ssr')} 篇；分页未启用）"))
         if risk:
             print(f"\n⛔ 风控熔断：{risk}\n   已停止，未做任何重试。请等待后再试。")
 

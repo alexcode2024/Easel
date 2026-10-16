@@ -179,14 +179,14 @@ export default function HarnessSettings({ onChange, onSelect }: {
                   onClick={() => setAutoApprove((previous) => !previous)}>
                   <span className="settings-permission-switch__thumb" />
                 </button>
-                <p id="codex-auto-approve-help" className="desc">保存后持续生效，仅影响 Easel 的 Codex：
+                <p id="codex-auto-approve-help" className="desc">保存后持续生效，仅影响 番茄工作台 的 Codex：
                   自动批准普通文件读取、搜索、Git 查看/拉取，以及项目工作区内的文件修改授权。
                   sudo、删除、系统修改、执行脚本及无法判断安全性的操作仍需确认；不是无限权限，可随时关闭。</p>
               </div>
             </div>
             </>
           )}
-          <p className="desc">认证由原生 CLI 管理，Easel 不迁移密钥。未自动批准的额外权限需在对话中确认；
+          <p className="desc">认证由原生 CLI 管理，番茄工作台 不迁移密钥。未自动批准的额外权限需在对话中确认；
             OpenCode / 通用 ACP 使用其原生权限策略，不是 Codex 沙箱。</p>
           <p className="desc"><code>{selected?.install_hint}</code></p>
           <p className="desc">“已安装”仅表示找到 CLI，不代表模型已登录；保存后请发送消息验证。</p>

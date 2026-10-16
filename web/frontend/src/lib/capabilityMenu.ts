@@ -6,7 +6,7 @@ export interface CapabilityGroup { id?: string; label: string; items: Capability
 export interface CapabilityTab { id: string; label: string; groups: CapabilityGroup[]; }
 export const CAPABILITY_MENU: { meta?: unknown; tabs: CapabilityTab[] } = {
  "meta": {
-  "name": "Easel 能力菜单",
+  "name": "番茄工作台 能力菜单",
   "version": "v1-draft",
   "date": "2026-09-17",
   "legend": {
@@ -268,7 +268,7 @@ export const CAPABILITY_MENU: { meta?: unknown; tabs: CapabilityTab[] } = {
       {
        "skill": "auto-short-video",
        "label": "一句话出片",
-       "desc": "一句话主题 → 成品短视频：自动串联 文案→配图/AI视频→配音→字幕→BGM→合成，把 Easel 制作层零件编排成一条'一键出片'流水线。**单条视频、口播/资讯向，画面默认逐句配图 + Ken Burns 缓动，需",
+       "desc": "一句话主题 → 成品短视频：自动串联 文案→配图/AI视频→配音→字幕→BGM→合成，把 番茄工作台 制作层零件编排成一条'一键出片'流水线。**单条视频、口播/资讯向，画面默认逐句配图 + Ken Burns 缓动，需",
        "status": "ready"
       },
       {
@@ -743,7 +743,7 @@ export const CAPABILITY_MENU: { meta?: unknown; tabs: CapabilityTab[] } = {
       {
        "skill": "skill-my-account",
        "label": "账号查询",
-       "desc": "查询用户自己在 Easel 已登录的小红书、抖音、快手、知乎和视频号身份、粉丝、获赞、关注及作品列表。 当用户问“我登录了哪些号、我是谁、我的粉丝/获赞、我最近发了什么、我有哪些帖子”时，先用本 SKILL 查本地登录态",
+       "desc": "查询用户自己在 番茄工作台 已登录的小红书、抖音、快手、知乎和视频号身份、粉丝、获赞、关注及作品列表。 当用户问“我登录了哪些号、我是谁、我的粉丝/获赞、我最近发了什么、我有哪些帖子”时，先用本 SKILL 查本地登录态",
        "status": "done"
       },
       {

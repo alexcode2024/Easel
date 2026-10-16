@@ -385,6 +385,12 @@ def test_window_login_is_valid_status(tmp_path):
 
 
 def xhs_page(url=xhs_publish.EXPLORE_URL, title="", body=""):
+    """假页面。
+
+    ``content()`` 按当前 URL 返回「已登录」或「游客」两种 SSR —— 登录流程现在用页面
+    自己的 HTML 判断主站会话（``_page_web_session``），假页面必须如实反映这一点，
+    否则测试就没在测真实契约。
+    """
     page = SimpleNamespace(
         url=url, title=lambda: title, inner_text=lambda *args, **kwargs: body,
         query_selector_all=lambda selector: [], wait_for_timeout=Mock(),
@@ -393,7 +399,15 @@ def xhs_page(url=xhs_publish.EXPLORE_URL, title="", body=""):
     def goto(destination, **kwargs):
         page.url = destination
 
+    def content():
+        if "/login" in (page.url or ""):
+            return ('<script>window.__INITIAL_STATE__={"user":{"loggedIn":false,'
+                    '"userInfo":{"guest":true,"userId":"guest"}}}</script>')
+        return ('<script>window.__INITIAL_STATE__={"user":{"loggedIn":true,'
+                '"userInfo":{"userId":"self-id","nickname":"Me"}}}</script>')
+
     page.goto = Mock(side_effect=goto)
+    page.content = content
     return page
 
 
@@ -634,7 +648,7 @@ def test_xhs_runner_persists_terminal_status_and_closes_browser(tmp_path, monkey
     page = xhs_page()
     if explore_timeout:
         page.goto.side_effect = TimeoutError("homepage timeout")
-    context = SimpleNamespace(pages=[page], close=Mock())
+    context = SimpleNamespace(pages=[page], new_page=Mock(return_value=page), close=Mock())
 
     class Manager:
         def __enter__(self):
@@ -658,7 +672,7 @@ def test_xhs_runner_persists_terminal_status_and_closes_browser(tmp_path, monkey
     if expected == "error":
         assert "300013" in status["message"]
     context.close.assert_called_once()
-    capture.assert_called_once_with(page, Path(args.qr_out), creator_only=explore_timeout)
+    capture.assert_called_once_with(page, Path(args.qr_out), need_web=explore_timeout)
 
 
 @pytest.mark.parametrize(("maintenance", "verified", "expected"), [
@@ -672,7 +686,7 @@ def test_xhs_scanned_login_checks_account_before_page_failure(
     from playwright import sync_api
 
     page = xhs_page()
-    context = SimpleNamespace(pages=[page], close=Mock())
+    context = SimpleNamespace(pages=[page], new_page=Mock(return_value=page), close=Mock())
 
     class Manager:
         def __enter__(self):
@@ -720,7 +734,7 @@ def test_login_runner_refreshes_qr_and_handles_success(tmp_path, monkeypatch, pl
 
     page = xhs_page()
     page.wait_for_selector = Mock()
-    context = SimpleNamespace(pages=[page], close=Mock())
+    context = SimpleNamespace(pages=[page], new_page=Mock(return_value=page), close=Mock())
 
     class Manager:
         def __enter__(self):
@@ -765,7 +779,7 @@ def test_zhihu_runner_handles_launch_failure_or_login_during_capture(tmp_path, m
 
     page = xhs_page()
     page.wait_for_selector = Mock()
-    context = SimpleNamespace(pages=[page], close=Mock())
+    context = SimpleNamespace(pages=[page], new_page=Mock(return_value=page), close=Mock())
     launch = Mock(side_effect=RuntimeError("browser failed")) if launch_failure \
         else Mock(return_value=context)
 
