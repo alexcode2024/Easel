@@ -12,8 +12,11 @@ import web.app as web
 def account_state(tmp_path, monkeypatch):
     monkeypatch.setattr(web, "BENCH_DIR", tmp_path / "bench")
     monkeypatch.setattr(web, "SESSIONS_DIR", tmp_path / "locks")
-    monkeypatch.setattr(web, "XHS_ACCESS_QUEUE", [])
-    monkeypatch.setattr(web, "_run_xhs_command", lambda *args, **kwargs: web.subprocess.run(*args, **kwargs))
+    monkeypatch.setattr(web, "PLATFORM_ACCESS_QUEUE", web.platform_access.AsyncResourceQueue(0.001))
+    adapter = web.platform_access.get_adapter("xiaohongshu")
+    monkeypatch.setattr(adapter, "shared_lock_path", tmp_path / "locks/platform.lock")
+    monkeypatch.setattr(web, "_run_platform_command",
+                        lambda cmd, platform, **kwargs: web.subprocess.run(cmd, **kwargs))
     monkeypatch.setattr(web, "LOGIN_DIR", tmp_path)
     monkeypatch.setattr(web, "LOGIN_PROCESSES", {})
     monkeypatch.setattr(web, "_WHOAMI_CACHE", {})

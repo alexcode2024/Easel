@@ -631,6 +631,8 @@ class DouyinAdapter(Adapter):
             if proxy:
                 launch["proxy"] = {"server": proxy}
             ctx = p.chromium.launch_persistent_context(str(profile), **launch)
+            import platform_access
+            platform_access.install_browser_guard(ctx, platform=self.key)
             try:
                 page = ctx.new_page()
 
@@ -1014,6 +1016,8 @@ class TiktokAdapter(Adapter):
                                             proxy=launch.get("proxy"))
                 ctx = browser.new_context(user_agent=UA, locale="en-US",
                                           viewport={"width": 1440, "height": 900})
+            import platform_access
+            platform_access.install_browser_guard(ctx, platform=self.key)
             try:
                 page = ctx.new_page()
 
@@ -1311,5 +1315,9 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    import xhs_access
-    sys.exit(xhs_access.run_cli(main, enabled="detail" in sys.argv and "xiaohongshu" in sys.argv))
+    import platform_access
+    import platform_adapters
+    command = sys.argv[1] if len(sys.argv) > 1 else ""
+    platform = platform_access.cli_option(sys.argv, "--platform") or ""
+    enabled = command in {"fetch", "detail"} and platform_access.get_adapter(platform) is not None
+    sys.exit(platform_access.run_cli(main, platform=platform or "xiaohongshu", enabled=enabled))

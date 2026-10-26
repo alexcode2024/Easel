@@ -629,6 +629,8 @@ def _scrape(platform: str, headed: bool, base: str | None, proxy: str | None) ->
                 if proxy:
                     kwargs["proxy"] = {"server": proxy}
                 ctx = p.chromium.launch_persistent_context(str(profile), **kwargs)
+                import platform_access
+                platform_access.install_browser_guard(ctx, platform=platform)
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
             try:
                 if platform == "xiaohongshu":
@@ -1224,5 +1226,9 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    import xhs_access
-    sys.exit(xhs_access.run_cli(main, enabled="xiaohongshu" in sys.argv))
+    import platform_access
+    import platform_adapters
+    command = sys.argv[1] if len(sys.argv) > 1 else ""
+    platform = platform_access.cli_option(sys.argv, "--platform") or ""
+    enabled = command == "fetch" and platform in PLATFORMS and platform_access.get_adapter(platform) is not None
+    sys.exit(platform_access.run_cli(main, platform=platform or "xiaohongshu", enabled=enabled))

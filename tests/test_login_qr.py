@@ -809,7 +809,7 @@ def web_functions():
     for node in nodes:
         node.decorator_list = []
     env = {"json": json, "subprocess": subprocess, "sys": sys, "asyncio": asyncio,
-           "_LOGIN_START_LOCKS": {}}
+           "_LOGIN_START_LOCKS": {}, "_platform_access_adapter": lambda _platform: None}
     exec(compile(ast.Module(body=nodes, type_ignores=[]), "web/app.py", "exec"), env)
     return env
 

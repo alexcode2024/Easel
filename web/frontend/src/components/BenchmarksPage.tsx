@@ -3,18 +3,18 @@ import {
   fetchBenchPlatforms, fetchBenchmarks, fetchBenchmark, createBenchmark, deleteBenchmark,
   fetchBenchmarkNow, fetchBenchmarkWorkDetail, fetchBenchmarkWorksDetailBatch,
   fetchAllBenchmarks, benchmarkFetchAllStatus,
-  fetchXhsAccessStatus,
+  fetchPlatformAccessStatus,
   fetchBenchCookies, downloadBenchWork,
   fetchMonitorSchedule, fetchMonitorStatus, runMonitorNow, toggleWorkMonitor,
   mediaUrl, createIdea,
 } from '../lib/api';
 import type {
   BenchAccount, BenchDetail, BenchPlatform, BenchWork, BenchCookieStatus, BenchMonitorSchedule,
-  XhsAccessStatus,
+  PlatformAccessStatus,
 } from '../lib/api';
 import CookieModal from './CookieModal';
 import WorkTrendModal from './WorkTrendModal';
-import XhsAccessBanner from './XhsAccessBanner';
+import PlatformAccessBanner from './PlatformAccessBanner';
 import { fmtDateTime, fmtWhen, pad2 } from '../lib/trendFormat';
 import { IconAccounts, IconTrash, IconChevron, IconChat } from './icons';
 
@@ -73,7 +73,7 @@ export default function BenchmarksPage({ onAskAgent, onBreakdown }: BenchmarksPa
   const [busyWork, setBusyWork] = useState('');
   const [syncBudget, setSyncBudget] = useState(0);
   const [cookies, setCookies] = useState<BenchCookieStatus[]>([]);
-  const [xhsAccess, setXhsAccess] = useState<XhsAccessStatus | null>(null);
+  const [platformAccess, setPlatformAccess] = useState<Record<string, PlatformAccessStatus> | null>(null);
   const [cookieForm, setCookieForm] = useState<{ platform: string; value: string } | null>(null);
   // 表现监控：设置（每天几点采样）+ 正在跑的那一轮进度；趋势弹窗针对单篇作品
   const [monitorInfo, setMonitorInfo] = useState<BenchMonitorSchedule | null>(null);
@@ -100,8 +100,8 @@ export default function BenchmarksPage({ onAskAgent, onBreakdown }: BenchmarksPa
     fetchBenchmarks().then(setAccounts).catch((e) => setErr(String(e.message || e)));
   }, []);
 
-  const loadXhsAccess = useCallback(() => {
-    fetchXhsAccessStatus().then(setXhsAccess).catch(() => setXhsAccess(null));
+  const loadPlatformAccess = useCallback(() => {
+    fetchPlatformAccessStatus().then(setPlatformAccess).catch(() => setPlatformAccess(null));
   }, []);
 
   const loadDetail = useCallback((id: string) => {
@@ -124,10 +124,10 @@ export default function BenchmarksPage({ onAskAgent, onBreakdown }: BenchmarksPa
 
   useEffect(() => { loadMonitorInfo(); }, [loadMonitorInfo]);
   useEffect(() => {
-    loadXhsAccess();
-    const timer = window.setInterval(loadXhsAccess, 3000);
+    loadPlatformAccess();
+    const timer = window.setInterval(loadPlatformAccess, 3000);
     return () => window.clearInterval(timer);
-  }, [loadXhsAccess]);
+  }, [loadPlatformAccess]);
 
   // 作品行的 「⋯」菜单：Esc 关闭（点空白由遮罩负责）
   useEffect(() => {
@@ -188,13 +188,13 @@ export default function BenchmarksPage({ onAskAgent, onBreakdown }: BenchmarksPa
         if (selected) loadDetail(selected);
         const b = await benchmarkFetchAllStatus();
         setBulk((prev) => (prev ? { ...prev, running: b.running, done: b.done, total: b.total } : prev));
-        loadXhsAccess();
+        loadPlatformAccess();
       } catch { /* 轮询失败忽略，下轮再试 */ }
     }, 3000);
     return () => {
       if (pollRef.current) { window.clearInterval(pollRef.current); pollRef.current = null; }
     };
-  }, [accounts, bulk, selected, loadDetail, loadXhsAccess]);
+  }, [accounts, bulk, selected, loadDetail, loadPlatformAccess]);
 
   const platMeta = useMemo(() => {
     const map: Record<string, BenchPlatform> = {};
@@ -434,7 +434,7 @@ export default function BenchmarksPage({ onAskAgent, onBreakdown }: BenchmarksPa
         </div>
       </div>
 
-      <XhsAccessBanner status={xhsAccess} />
+      <PlatformAccessBanner statuses={platformAccess} />
 
       {err && <div className="bench-err">{err}</div>}
 

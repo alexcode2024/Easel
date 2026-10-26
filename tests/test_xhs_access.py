@@ -17,6 +17,7 @@ import app as web
 import xhs_access as safety
 import xhs_fetch as fetch
 import xhs_sync as sync
+import platform_adapters
 
 
 @pytest.fixture(autouse=True)
@@ -24,12 +25,13 @@ def isolated(monkeypatch, tmp_path):
     monkeypatch.setattr(web, "BENCH_DIR", tmp_path / "bench")
     monkeypatch.setattr(web, "BENCH_ACCOUNTS_FILE", tmp_path / "bench/accounts.json")
     monkeypatch.setattr(web, "SESSIONS_DIR", tmp_path / "sessions")
-    monkeypatch.setattr(web, "XHS_ACCESS_QUEUE", [])
-    monkeypatch.setattr(web, "XHS_ACCESS_POLL", 0.001)
+    monkeypatch.setattr(web, "PLATFORM_ACCESS_QUEUE", web.platform_access.AsyncResourceQueue(0.001))
+    adapter = web.platform_access.get_adapter("xiaohongshu")
+    monkeypatch.setattr(adapter, "shared_lock_path", tmp_path / "sessions/platform.lock")
+    monkeypatch.setattr(adapter, "shared_pace_path", tmp_path / "pace.json")
     monkeypatch.setattr(safety, "STATE_FILE", tmp_path / "state.json")
     monkeypatch.setattr(safety, "LOCK_FILE", tmp_path / "slot.lock")
     monkeypatch.setattr(safety, "PACE_FILE", tmp_path / "pace.json")
-    monkeypatch.setattr(safety, "_depth", 0)
     monkeypatch.setattr(safety, "_budget", 20)
 
 
@@ -60,7 +62,7 @@ def test_different_benchmarks_and_identity_share_one_slot(monkeypatch):
             assert status["concurrency"] == 1
             assert [entry["position"] for entry in status["queue"]] == [1, 2, 3]
         await asyncio.gather(*tasks)
-        assert not web.XHS_ACCESS_QUEUE
+        assert not web.PLATFORM_ACCESS_QUEUE._queues.get("xiaohongshu:default", [])
 
     asyncio.run(scenario())
     assert events == ["benchA", "benchB", "whoami"]
@@ -80,7 +82,7 @@ def test_risk_discards_waiting_work_and_survives_restart():
     asyncio.run(scenario())
     state = json.loads(web._xhs_access_file().read_text())
     assert state["risk_until"] > state["risk_triggered_at"]
-    assert not web.XHS_ACCESS_QUEUE
+    assert not web.PLATFORM_ACCESS_QUEUE._queues.get("xiaohongshu:default", [])
 
 
 def test_cancellation_keeps_slot_until_thread_finishes():
@@ -121,7 +123,7 @@ def test_cancelled_waiter_does_not_leave_stale_queue():
                 await waiter
         async with web._xhs_access("next"):
             pass
-        assert web.XHS_ACCESS_QUEUE == []
+        assert not web.PLATFORM_ACCESS_QUEUE._queues.get("xiaohongshu:default", [])
 
     asyncio.run(scenario())
 
@@ -175,9 +177,9 @@ def test_script_request_pacing_and_budget(monkeypatch, delay):
         assert (minimum, maximum) == (8, 15)
         return delay
 
-    monkeypatch.setattr(safety.time, "sleep", waits.append)
-    monkeypatch.setattr(safety.time, "time", lambda: 100)
-    monkeypatch.setattr(safety.random, "uniform", uniform)
+    monkeypatch.setattr(safety.platform_access.time, "sleep", waits.append)
+    monkeypatch.setattr(safety.platform_access.time, "time", lambda: 100)
+    monkeypatch.setattr(safety.platform_access.random, "uniform", uniform)
     monkeypatch.setattr(safety, "_budget", 1)
 
     def request():
@@ -194,7 +196,7 @@ def test_script_request_pacing_and_budget(monkeypatch, delay):
 
 
 def test_script_risk_prevents_next_request(monkeypatch):
-    monkeypatch.setattr(safety.time, "sleep", lambda delay: None)
+    monkeypatch.setattr(safety.platform_access.time, "sleep", lambda delay: None)
     with safety.session():
         with pytest.raises(safety.AccessStopped):
             safety.request(lambda: SimpleNamespace(status_code=461, text="blocked"))
@@ -244,7 +246,7 @@ def test_media_risk_does_not_retry_another_candidate(monkeypatch, tmp_path):
         return SimpleNamespace(status_code=461, close=lambda: closed.append(True))
 
     monkeypatch.setattr(requests, "get", blocked)
-    with pytest.raises(safety.AccessStopped):
+    with safety.session(), pytest.raises(safety.AccessStopped):
         sync.note._download(["first", "second"], tmp_path / "image.jpg", referer="")
     assert calls == ["first"]
     assert closed == [True]

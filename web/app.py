@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextvars
+from dataclasses import replace
 import mimetypes
 import math
 import os
@@ -209,6 +211,9 @@ SHARED_SCRIPTS = PROJECT_ROOT / "skills" / "shared" / "scripts"
 if str(SHARED_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SHARED_SCRIPTS))
 
+import platform_access
+import platform_adapters
+
 from model_registry import model_group
 
 BROWSER_PROFILES = Path.home() / ".easel-browser-profiles"
@@ -221,6 +226,7 @@ SESSIONS_DIR = OUTPUTS_DIR / "_sessions"   # 每会话最近一轮的完整结�
 SYSTEM_TOPLEVEL_DIRS = {"analytics"}
 LOGIN_TIMEOUT = 240
 LOGIN_PROCESSES: dict[str, subprocess.Popen] = {}
+PLATFORM_PUBLISH_TASKS: dict[str, asyncio.Task] = {}
 
 # whoami 真校验（起 headless 浏览器，数秒）的进程内缓存：避免账号页 + 工作台重复起浏览器。
 WHOAMI_TTL = 600  # 秒
@@ -4283,13 +4289,16 @@ async def api_account_session(platform: str, check: bool = False):
         cmd = [sys.executable, str(SHARED_SCRIPTS / 'xhs_publish.py'), 'whoami', '--no-proxy',
                '--cookie-file', cookie_file]
         try:
-            async with _xhs_access("检查小红书会话"):
+            adapter = _platform_access_adapter(platform)
+            platform_name = adapter.policy.display_name if adapter else platform
+            async with _platform_access(platform, f"检查{platform_name}会话"):
                 proc = await _access_thread(_run_xhs_command, cmd, cwd=str(PROJECT_ROOT),
                                                env=_proxy_env(), capture_output=True, text=True,
                                                encoding='utf-8', timeout=90)
-                risk = _xhs_mark_result(proc.returncode, {}, (proc.stdout or '') + '\n' + (proc.stderr or ''))
+                risk = _platform_mark_result(
+                    platform, proc.returncode, {}, (proc.stdout or '') + '\n' + (proc.stderr or ''))
             if risk:
-                out['error'] = f'小红书访问已暂停：{risk}'
+                out['error'] = f'{platform_name}访问已暂停：{risk}'
                 return out
             for line in reversed((proc.stdout or '').strip().splitlines()):
                 if line.strip().startswith('{'):
@@ -4301,7 +4310,8 @@ async def api_account_session(platform: str, check: bool = False):
                     checked_now = True
                     break
         except XHSRiskError as error:
-            out['error'] = f'小红书访问已暂停：{error}'
+            name = _platform_access_adapter(platform).policy.display_name
+            out['error'] = f'{name}访问已暂停：{error}'
         except subprocess.TimeoutExpired:
             out['error'] = '校验超时'
         except Exception as error:  # noqa: BLE001
@@ -4363,7 +4373,7 @@ async def _start_login(platform: str, restart: bool = False):
         except subprocess.TimeoutExpired:
             raise HTTPException(409, '上一次登录仍在退出，请稍后重试') from None
         LOGIN_PROCESSES.pop(platform, None)
-    xhs_entry = None
+    access_entry = None
     LOGIN_DIR.mkdir(parents=True, exist_ok=True)
     qr = LOGIN_DIR / f'{platform}.png'
     status = LOGIN_DIR / f'{platform}.json'
@@ -4403,23 +4413,26 @@ async def _start_login(platform: str, restart: bool = False):
     login_env['PYTHONIOENCODING'] = 'utf-8'
     login_env['PYTHONUTF8'] = '1'
     try:
-        if backend == 'xhs':
+        if _platform_access_adapter(platform) is not None:
             try:
-                xhs_entry = await _xhs_access_enter("小红书扫码登录")
+                access_entry = await _platform_access_enter(
+                    platform, f"{LOGIN_RUNNERS.get(platform, {}).get('name', platform)}扫码登录")
             except XHSRiskError as error:
-                raise HTTPException(429, f"小红书访问已暂停：{error}") from None
+                raise HTTPException(429, f"{LOGIN_RUNNERS.get(platform, {}).get('name', platform)}访问已暂停：{error}") from None
+            login_env = platform_access.environment_for(
+                _platform_access_resource(platform), login_env)
         proc = subprocess.Popen(cmd, cwd=str(PROJECT_ROOT), env=login_env,
                                 stdout=log_file, stderr=subprocess.STDOUT)
     except BaseException:
-        if xhs_entry is not None:
-            _xhs_access_leave(xhs_entry, "error", "登录进程启动失败")
+        if access_entry is not None:
+            _platform_access_leave(access_entry, "error", "登录进程启动失败")
         raise
     finally:
         log_file.close()
     LOGIN_PROCESSES[platform] = proc
-    if xhs_entry is not None:
-        XHS_LOGIN_ACCESS[platform] = xhs_entry
-        asyncio.create_task(_xhs_release_process_access(platform, proc, xhs_entry))
+    if access_entry is not None:
+        PLATFORM_LOGIN_ACCESS[platform] = access_entry
+        asyncio.create_task(_platform_release_process_access(platform, proc, access_entry))
     s = _login_status(platform)
     if s['state'] == 'unknown':
         s.update(state='starting', message='正在启动浏览器并准备二维码…')
@@ -4603,12 +4616,12 @@ async def api_account_whoami(platform: str, force: bool = False):
 
 
 async def _check_account_whoami(platform: str, force: bool = False):
-    if platform == "xiaohongshu":
+    if _platform_access_adapter(platform) is not None:
         try:
-            async with _xhs_access("校验小红书登录态"):
+            async with _platform_access_context(platform, f"校验{LOGIN_RUNNERS.get(platform, {}).get('name', platform)}登录态"):
                 return await _check_account_whoami_unlocked(platform, force)
         except XHSRiskError as error:
-            raise HTTPException(429, f"小红书访问已暂停：{error}") from None
+            raise HTTPException(429, f"{LOGIN_RUNNERS.get(platform, {}).get('name', platform)}访问已暂停：{error}") from None
     return await _check_account_whoami_unlocked(platform, force)
 
 
@@ -4674,16 +4687,19 @@ async def _check_account_whoami_unlocked(platform: str, force: bool = False):
         cmd = [sys.executable, str(SHARED_SCRIPTS / 'web_publisher.py'), 'whoami',
                '--platform', cfg['wp']]
     try:
-        runner = _run_xhs_command if backend == 'xhs' else subprocess.run
+        runner = _run_platform_command if _platform_access_adapter(platform) else subprocess.run
+        runner_kwargs = {"platform": platform} if runner is _run_platform_command else {}
         proc = await _access_thread(runner, cmd, cwd=str(PROJECT_ROOT), env=_proxy_env(),
                                        capture_output=True, text=True, encoding='utf-8',
-                                       timeout=90 if backend == 'xhs' else 40 if backend in ('douyin', 'wechat-oa') else 60)
+                                       timeout=90 if backend == 'xhs' else 40 if backend in ('douyin', 'wechat-oa') else 60,
+                                       **runner_kwargs)
     except subprocess.TimeoutExpired:
         raise HTTPException(504, '校验超时（浏览器起不来或网络慢）')
-    if backend == 'xhs':
-        risk = _xhs_mark_result(proc.returncode, {}, (proc.stdout or '') + '\n' + (getattr(proc, 'stderr', '') or ''))
+    if _platform_access_adapter(platform):
+        risk = _platform_mark_result(platform, proc.returncode, {},
+                                     (proc.stdout or '') + '\n' + (getattr(proc, 'stderr', '') or ''))
         if risk:
-            raise HTTPException(429, f'小红书访问已暂停：{risk}')
+            raise HTTPException(429, f'{cfg["name"]}访问已暂停：{risk}')
     data = {'loggedIn': False, 'name': '', 'avatar': ''}
     confident = False
     for line in reversed((proc.stdout or '').strip().splitlines()):
@@ -4824,7 +4840,15 @@ def _run_analytics_command(cmd: list[str], env: dict[str, str], timeout: int):
 
 
 def _run_xhs_command(cmd: list[str], **kwargs):
-    return _run_analytics_command(cmd, kwargs["env"], kwargs["timeout"])
+    return _run_platform_command(cmd, "xiaohongshu", **kwargs)
+
+
+def _run_platform_command(cmd: list[str], platform: str, **kwargs):
+    env = kwargs["env"]
+    resource = _ACTIVE_PLATFORM_ACCESS.get()
+    if resource and resource.platform == platform:
+        env = platform_access.environment_for(resource, env)
+    return _run_analytics_command(cmd, env, kwargs["timeout"])
 
 
 @app.get("/api/analytics/platforms")
@@ -4876,15 +4900,20 @@ async def _fetch_analytics(platform: str):
     ana_env.update(PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
     try:
         async with _platform_access(platform, f"读取{LOGIN_RUNNERS.get(platform, {}).get('name', platform)}创作数据"):
-            proc = await _access_thread(
-                _run_analytics_command, cmd, ana_env,
-                300 if platform == "xiaohongshu" else 180 if platform == "wechat-oa" else 90)
-            if platform == "xiaohongshu":
-                risk = _xhs_mark_result(proc.returncode, {}, (proc.stdout or '') + '\n' + (proc.stderr or ''))
+            adapter = _platform_access_adapter(platform)
+            timeout = adapter.policy.command_timeout if adapter else (180 if platform == "wechat-oa" else 90)
+            if _platform_access_adapter(platform):
+                proc = await _access_thread(_run_platform_command, cmd, platform,
+                                            env=ana_env, timeout=timeout)
+            else:
+                proc = await _access_thread(_run_analytics_command, cmd, ana_env, timeout)
+            if _platform_access_adapter(platform):
+                risk = _platform_mark_result(
+                    platform, proc.returncode, {}, (proc.stdout or '') + '\n' + (proc.stderr or ''))
                 if risk:
-                    raise HTTPException(429, f"小红书访问已暂停：{risk}")
+                    raise HTTPException(429, f"{LOGIN_RUNNERS.get(platform, {}).get('name', platform)}访问已暂停：{risk}")
     except XHSRiskError as error:
-        raise HTTPException(429, f"小红书访问已暂停：{error}") from None
+        raise HTTPException(429, f"{LOGIN_RUNNERS.get(platform, {}).get('name', platform)}访问已暂停：{error}") from None
     except subprocess.TimeoutExpired:
         raise HTTPException(504, "抓取超时，已停止浏览器；请检查网络，关闭正在进行的登录或校验后重试")
     for line in reversed((proc.stdout or "").strip().splitlines()):
@@ -4941,17 +4970,21 @@ def _read_publish_status(platform: str) -> dict:
     return {'state': 'unknown', 'message': ''}
 
 
-def _run_publish_bg(platform: str, cmd: list, title: str, body: str, cfg: dict,
-                    status_file: Path, code_file: Path) -> None:
+async def _run_publish_bg(platform: str, cmd: list, title: str, body: str, cfg: dict,
+                          status_file: Path, code_file: Path) -> None:
     """后台线程跑发布脚本（脚本自身把 starting/sms_required/verifying/success/error 写进 status_file）。
     结束后兜底补写终态 + 记 _publish.log + 成功则回流排期。"""
     ok = False
     out = err = ''
     try:
-        proc = subprocess.run(cmd, cwd=str(PROJECT_ROOT), env=_publish_env(),
-                              capture_output=True, text=True, timeout=900)
-        ok = proc.returncode == 0
-        out, err = proc.stdout or '', proc.stderr or ''
+        async with _platform_access(platform, f"发布{cfg.get('name', platform)}内容"):
+            proc = await _access_thread(
+                _run_platform_command, cmd, platform, env=_publish_env(), timeout=900)
+            out, err = proc.stdout or '', proc.stderr or ''
+            risk = _platform_mark_result(platform, proc.returncode, {}, out + '\n' + err)
+            ok = proc.returncode == 0 and not risk
+            if risk:
+                err = risk
     except subprocess.TimeoutExpired:
         err = '发布超时（>900s）'
     except Exception as e:  # noqa: BLE001
@@ -4982,18 +5015,26 @@ def _run_publish_bg(platform: str, cmd: list, title: str, body: str, cfg: dict,
             pass
 
 
-def _start_async_publish(platform: str, cmd: list, title: str, body: str, cfg: dict,
-                         status_file: Path, code_file: Path) -> dict:
+async def _start_async_publish(platform: str, cmd: list, title: str, body: str, cfg: dict,
+                               status_file: Path, code_file: Path) -> dict:
     """启动异步发布：清旧码/状态 → 起后台线程 → 立即返回。前端轮询 /api/publish/{p}/status，
     遇 sms_required 弹输入框、提交到 /api/publish/{p}/sms。"""
+    running = PLATFORM_PUBLISH_TASKS.get(platform)
+    if running is not None and not running.done():
+        return {'async': True, 'pending': True, 'message': '该平台已有发布任务正在运行'}
     try:
         code_file.unlink()
     except OSError:
         pass
     _write_publish_status(status_file, 'starting', '发布中…（若触发风控会要求短信验证）')
-    threading.Thread(target=_run_publish_bg,
-                     args=(platform, cmd, title, body, cfg, status_file, code_file),
-                     daemon=True).start()
+    task = asyncio.create_task(_run_publish_bg(platform, cmd, title, body, cfg, status_file, code_file))
+    PLATFORM_PUBLISH_TASKS[platform] = task
+
+    def clear_publish_task(finished: asyncio.Task) -> None:
+        if PLATFORM_PUBLISH_TASKS.get(platform) is finished:
+            PLATFORM_PUBLISH_TASKS.pop(platform, None)
+
+    task.add_done_callback(clear_publish_task)
     # 关键：**不返回 ok:true**——这只是「已启动」的应答，真正结果要靠轮询 /status。
     # 若这里给 ok:true，旧前端会把它当「已发布」立刻显示成功（假成功 bug，真机踩过）。
     return {'async': True, 'pending': True, 'message': '发布已启动，请稍候…'}
@@ -5069,7 +5110,7 @@ async def api_publish(platform: str, req: PublishRequest):
         status_file = PUBLISH_DIR / 'douyin.json'
         code_file = PUBLISH_DIR / 'douyin.code'
         cmd += ['--status-file', str(status_file), '--sms-code-file', str(code_file)]
-        return _start_async_publish(platform, cmd, title, req.body, cfg, status_file, code_file)
+        return await _start_async_publish(platform, cmd, title, req.body, cfg, status_file, code_file)
     elif platform == 'wechat-oa':
         # 微信公众号：走「后台会话」发布（免 AppID/AppSecret、免 IP 白名单）。
         # 正文 MD → 公众号 HTML（skill 排版器）→ 会话建草稿（weixin_mp_stats.py publish，内嵌图传 mp CDN）。
@@ -5109,18 +5150,22 @@ async def api_publish(platform: str, req: PublishRequest):
     # 公众号走后台会话（Playwright，脚本自带 --proxy，默认直连）；其余平台走 _publish_env
     pub_env = _proxy_env() if platform == 'wechat-oa' else _publish_env()
     try:
-        if platform == 'xiaohongshu':
-            async with _xhs_access("发布小红书内容"):
-                proc = await _access_thread(_run_xhs_command, cmd, cwd=str(PROJECT_ROOT), env=pub_env,
-                                               capture_output=True, text=True, timeout=600)
-                risk = _xhs_mark_result(proc.returncode, {}, (proc.stdout or '') + '\n' + (proc.stderr or ''))
+        adapter = _platform_access_adapter(platform)
+        if adapter:
+            async with _platform_access(platform, f"发布{adapter.policy.display_name}内容"):
+                proc = await _access_thread(
+                    _run_platform_command, cmd, platform, env=pub_env, timeout=600)
+                risk = _platform_mark_result(
+                    platform, proc.returncode, {}, (proc.stdout or '') + '\n' + (proc.stderr or ''))
             if risk:
-                return {'ok': False, 'message': '小红书访问已暂停', 'detail': risk}
+                return {'ok': False, 'message': f'{adapter.policy.display_name}访问已暂停', 'detail': risk}
         else:
             proc = await asyncio.to_thread(subprocess.run, cmd, cwd=str(PROJECT_ROOT), env=pub_env,
                                            capture_output=True, text=True, timeout=600)
     except XHSRiskError as error:
-        raise HTTPException(429, f'小红书访问已暂停：{error}') from None
+        adapter = _platform_access_adapter(platform)
+        name = adapter.policy.display_name if adapter else platform
+        raise HTTPException(429, f'{name}访问已暂停：{error}') from None
     except subprocess.TimeoutExpired:
         raise HTTPException(504, '发布超时（媒体处理慢或流程卡住）')
     ok = proc.returncode == 0
@@ -5628,138 +5673,136 @@ BENCH_DETAIL_MAX = 20              # 一次批量深挖上限（每条 = 一个 
 # 纯 HTTP 伪装指纹比浏览器稳得多，但读取节奏仍按成熟工具的取值来，不自己造更激进的参数。
 BENCH_DETAIL_AVG_GAP = 6.0
 BENCH_DETAIL_SIGMA = 0.6
-XHS_ACCESS_RISK_COOLDOWN = 3600
-XHS_ACCESS_POLL = 0.2
-XHS_ACCESS_QUEUE: list[dict] = []
-XHS_LOGIN_ACCESS: dict[str, dict] = {}
+PLATFORM_ACCESS_POLL = 0.2
+PLATFORM_ACCESS_QUEUE = platform_access.AsyncResourceQueue(PLATFORM_ACCESS_POLL)
+PLATFORM_LOGIN_ACCESS: dict[str, dict] = {}
+_ACTIVE_PLATFORM_ACCESS: contextvars.ContextVar[platform_access.AccessResource | None] = contextvars.ContextVar(
+    "web_platform_access_resource", default=None)
 
 
-class XHSRiskError(RuntimeError):
-    """The shared Xiaohongshu circuit breaker is open."""
+XHSRiskError = platform_access.AccessStopped
 
 
 def _xhs_access_file() -> Path:
     return BENCH_DIR / "xhs_access.json"
 
 
+def _platform_access_resource(platform: str, account_id: str = "default"):
+    return platform_access.AccessResource(platform, account_id)
+
+
+def _platform_access_adapter(platform: str):
+    adapter = platform_access.get_adapter(platform)
+    if adapter is None:
+        return None
+    return replace(
+        adapter,
+        persistent_path=BENCH_DIR / adapter.persistent_path.name,
+        shared_lock_path=(SESSIONS_DIR / adapter.shared_lock_path.name
+                          if adapter.shared_lock_path else None),
+        shared_pace_path=(OUTPUTS_DIR / "_locks" / adapter.shared_pace_path.name
+                          if adapter.shared_pace_path else None),
+    )
+
+
+def _platform_access_risk_status(platform: str, account_id: str = "default") -> dict:
+    adapter = _platform_access_adapter(platform)
+    if adapter is None:
+        return {"active": False, "until": 0, "reason": "", "triggered_at": 0}
+    return adapter.risk_status(_platform_access_resource(platform, account_id))
+
+
+def _platform_trip_risk(platform: str, reason: str, account_id: str = "default") -> dict:
+    adapter = _platform_access_adapter(platform)
+    if adapter is None:
+        return {"active": False, "until": 0, "reason": "", "triggered_at": 0}
+    return adapter.trip(_platform_access_resource(platform, account_id), reason)
+
+
+def _platform_mark_result(platform: str, code: int = 0, payload: dict | None = None,
+                          text: str = "") -> str:
+    adapter = _platform_access_adapter(platform)
+    if adapter is None:
+        return ""
+    resource = _platform_access_resource(platform)
+    result = platform_access.AccessResult(exit_code=code, payload=payload, text=text)
+    return adapter.mark_result(resource, result)
+
+
 def _xhs_read_access_state() -> dict:
-    fp = _xhs_access_file()
-    if not fp.is_file():
-        return {}
-    try:
-        data = json.loads(fp.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
+    adapter = _platform_access_adapter("xiaohongshu")
+    return platform_access._read_json(adapter.state_path(_platform_access_resource("xiaohongshu")))
 
 
 def _xhs_write_access_state(data: dict) -> None:
-    _bench_write_json(_xhs_access_file(), data)
+    adapter = _platform_access_adapter("xiaohongshu")
+    platform_access._write_json(adapter.state_path(_platform_access_resource("xiaohongshu")), data)
 
 
 def _xhs_risk_status() -> dict:
-    data = _xhs_read_access_state()
-    until = int(data.get("risk_until") or 0)
-    active = until > int(time.time())
-    return {
-        "active": active,
-        "until": until if active else 0,
-        "reason": str(data.get("risk_reason") or "") if active else "",
-        "triggered_at": int(data.get("risk_triggered_at") or 0),
-    }
+    return _platform_access_risk_status("xiaohongshu")
 
 
 def _xhs_trip_risk(reason: str) -> dict:
     """Open the shared breaker once; never retry the request that triggered it."""
-    now = int(time.time())
-    current = _xhs_read_access_state()
-    until = int(current.get("risk_until") or 0)
-    if until <= now:
-        until = now + XHS_ACCESS_RISK_COOLDOWN
-        current.update({"risk_until": until, "risk_reason": str(reason)[:240],
-                       "risk_triggered_at": now})
-        _xhs_write_access_state(current)
-    return _xhs_risk_status()
+    return _platform_trip_risk("xiaohongshu", reason)
 
 
 def _xhs_result_risk(code: int = 0, payload: dict | None = None, text: str = "") -> str:
-    payload = payload or {}
-    haystack = " ".join(str(payload.get(key) or "") for key in
-                        ("risk", "risk_control", "error", "message")) + " " + (text or "")
-    marker = re.search(r"风控|风险|300012|NeedVerify|验证码|访问频繁|captcha|\b(?:429|461)\b", haystack,
-                       re.IGNORECASE)
-    if marker:
-        return f"平台校验信号：{marker.group()}"
-    if code in (2, 429, 461) or payload.get("risk") or payload.get("risk_control"):
-        return "平台访问限制，本轮已停止"
-    return ""
+    adapter = _platform_access_adapter("xiaohongshu")
+    return adapter.classify_result(
+        platform_access.AccessResult(exit_code=code, payload=payload, text=text))
 
 
 def _xhs_mark_result(code: int = 0, payload: dict | None = None, text: str = "") -> str:
-    reason = _xhs_result_risk(code, payload, text)
-    if reason:
-        _xhs_trip_risk(reason)
-    return reason
+    return _platform_mark_result("xiaohongshu", code, payload, text)
 
 
 async def _xhs_access_enter(label: str) -> dict:
-    entry = {"id": uuid.uuid4().hex[:12], "label": label, "state": "queued",
-             "queued_at": int(time.time()), "started_at": 0, "message": ""}
-    XHS_ACCESS_QUEUE.append(entry)
-    proc_lock = None
-    proc_acquired = False
-    try:
-        while True:
-            risk = _xhs_risk_status()
-            if risk["active"]:
-                entry.update(state="risk", message=f"小红书风控暂停，预计 {risk['until']} 后恢复")
-                raise XHSRiskError(risk["reason"] or "小红书风控熔断已开启")
-            if XHS_ACCESS_QUEUE and XHS_ACCESS_QUEUE[0] is entry:
-                while not proc_acquired:
-                    proc_lock = _CrossProcLock("xiaohongshu-account")
-                    proc_acquired = proc_lock.acquire(0, 0)
-                    if not proc_acquired:
-                        if proc_lock._fh is None:
-                            raise RuntimeError("无法创建小红书访问锁，已拒绝访问")
-                        proc_lock.release()
-                        await asyncio.sleep(XHS_ACCESS_POLL)
-                risk = _xhs_risk_status()
-                if risk["active"]:
-                    raise XHSRiskError("小红书风控暂停")
-                entry.update(state="running", started_at=int(time.time()), message="正在访问小红书")
-                entry["proc_lock"] = proc_lock
-                return entry
-            await asyncio.sleep(XHS_ACCESS_POLL)
-    except BaseException:
-        if proc_acquired and proc_lock is not None:
-            proc_lock.release()
-        if entry in XHS_ACCESS_QUEUE:
-            XHS_ACCESS_QUEUE.remove(entry)
-        raise
+    return await _platform_access_enter("xiaohongshu", label)
+
+
+async def _platform_access_enter(platform: str, label: str, account_id: str = "default") -> dict:
+    adapter = _platform_access_adapter(platform)
+    if adapter is None:
+        raise ValueError(f"平台未注册访问适配器：{platform}")
+    resource = _platform_access_resource(platform, account_id)
+    return await PLATFORM_ACCESS_QUEUE.enter(
+        adapter, resource, label, lambda current: adapter.check_breaker(current),
+        use_process_lock=True)
 
 
 def _xhs_access_leave(entry: dict, state: str = "done", message: str = "") -> None:
-    entry.update(state=state, message=message, finished_at=int(time.time()))
-    proc_lock = entry.pop("proc_lock", None)
-    if proc_lock is not None:
-        proc_lock.release()
-    if entry in XHS_ACCESS_QUEUE:
-        XHS_ACCESS_QUEUE.remove(entry)
+    PLATFORM_ACCESS_QUEUE.leave(entry, state, message)
+
+
+def _platform_access_leave(entry: dict, state: str = "done", message: str = "") -> None:
+    PLATFORM_ACCESS_QUEUE.leave(entry, state, message)
 
 
 @asynccontextmanager
 async def _xhs_access(label: str):
-    entry = await _xhs_access_enter(label)
-    try:
+    async with _platform_access_context("xiaohongshu", label) as entry:
         yield entry
-    except XHSRiskError as error:
-        _xhs_access_leave(entry, "risk", str(error)[:240])
-        raise
-    except BaseException as error:
-        _xhs_access_leave(entry, "error", f"{type(error).__name__}: {error}"[:240])
-        raise
-    else:
-        _xhs_access_leave(entry)
+
+
+@asynccontextmanager
+async def _platform_access_context(platform: str, label: str, account_id: str = "default"):
+    entry = await _platform_access_enter(platform, label, account_id)
+    token = _ACTIVE_PLATFORM_ACCESS.set(_platform_access_resource(platform, account_id))
+    try:
+        try:
+            yield entry
+        except platform_access.AccessStopped as error:
+            _platform_access_leave(entry, "risk", str(error)[:240])
+            raise
+        except BaseException as error:
+            _platform_access_leave(entry, "error", f"{type(error).__name__}: {error}"[:240])
+            raise
+        else:
+            _platform_access_leave(entry)
+    finally:
+        _ACTIVE_PLATFORM_ACCESS.reset(token)
 
 
 async def _access_thread(function, *args, **kwargs):
@@ -5781,44 +5824,57 @@ async def _access_thread(function, *args, **kwargs):
 
 @asynccontextmanager
 async def _platform_access(platform: str, label: str):
-    if platform == "xiaohongshu":
-        async with _xhs_access(label) as entry:
+    if _platform_access_adapter(platform) is not None:
+        async with _platform_access_context(platform, label) as entry:
             yield entry
     else:
         yield None
 
 
 def _xhs_access_snapshot() -> dict:
-    risk = _xhs_risk_status()
-    active = next((e for e in XHS_ACCESS_QUEUE if e.get("state") == "running"), None)
-    queue = []
-    for entry in XHS_ACCESS_QUEUE:
-        if entry.get("state") != "queued":
-            continue
-        queue.append({"id": entry["id"], "label": entry["label"],
-                      "state": "queued", "position": len(queue) + 1,
-                      "queued_at": entry["queued_at"]})
-    return {"resource": "xiaohongshu", "concurrency": 1, "active":
-            ({"id": active["id"], "label": active["label"], "started_at": active["started_at"]}
-             if active else None), "queue": queue, "queued": len(queue), "risk": risk}
+    adapter = _platform_access_adapter("xiaohongshu")
+    resource = _platform_access_resource("xiaohongshu")
+    return PLATFORM_ACCESS_QUEUE.snapshot(
+        adapter, resource, _platform_access_risk_status("xiaohongshu"))
 
 
-async def _xhs_release_process_access(platform: str, proc, entry: dict) -> None:
+def _platform_access_snapshot(platform: str) -> dict:
+    adapter = _platform_access_adapter(platform)
+    resource = _platform_access_resource(platform)
+    return PLATFORM_ACCESS_QUEUE.snapshot(
+        adapter, resource, _platform_access_risk_status(platform))
+
+
+def _platform_access_snapshots() -> dict:
+    return {adapter.policy.platform: _platform_access_snapshot(adapter.policy.platform)
+            for adapter in platform_access.adapters()}
+
+
+async def _platform_release_process_access(platform: str, proc, entry: dict) -> None:
     try:
         await asyncio.to_thread(proc.wait)
         status = _login_status(platform)
-        _xhs_mark_result(proc.returncode or 0, {}, status.get("message", ""))
+        _platform_mark_result(platform, proc.returncode or 0, {}, status.get("message", ""))
     except Exception:
         pass
     finally:
-        if XHS_LOGIN_ACCESS.get(platform) is entry:
-            XHS_LOGIN_ACCESS.pop(platform, None)
-        _xhs_access_leave(entry, "done")
+        if PLATFORM_LOGIN_ACCESS.get(platform) is entry:
+            PLATFORM_LOGIN_ACCESS.pop(platform, None)
+        _platform_access_leave(entry, "done")
+
+
+async def _xhs_release_process_access(platform: str, proc, entry: dict) -> None:
+    await _platform_release_process_access(platform, proc, entry)
 
 
 @app.get("/api/xhs/access/status")
 async def api_xhs_access_status():
     return _xhs_access_snapshot()
+
+
+@app.get("/api/platform-access/status")
+async def api_platform_access_status():
+    return _platform_access_snapshots()
 
 
 def _bench_detail_gap() -> float:
@@ -5963,9 +6019,9 @@ async def _bench_run_note_download(bid: str, work_id: str, note_id: str, token: 
     if cookie_file:
         args += ["--cookie-file", cookie_file]
     try:
-        async with _xhs_access(f"下载作品 {work_id}"):
+        async with _platform_access(platform, f"下载作品 {work_id}"):
             code, res = await _run_json_script(XHS_NOTE_SCRIPT, args)
-            risk = _xhs_mark_result(code, res)
+            risk = _platform_mark_result(platform, code, res)
         if risk:
             _bench_write_status(bid, "risk", f"小红书风控熔断：{risk}")
             return
@@ -6089,10 +6145,18 @@ def _bench_script(subcmd: list[str], timeout: int = 30) -> tuple[int, dict]:
         # 显式按 UTF-8 解码，不跟随 locale：Windows 默认 GBK 时会 UnicodeDecodeError，
         # 整个平台能力矩阵就变成空列表（`easel web` 设了 PYTHONUTF8=1 才没暴露）。
         # 与 _run_json_script 保持同一套解码约定。
-        runner = _run_xhs_command if "xiaohongshu" in subcmd else subprocess.run
-        proc = runner(cmd, cwd=str(PROJECT_ROOT), env=env,
-                              capture_output=True, text=True, encoding="utf-8",
-                              errors="replace", timeout=timeout)
+        platform = ""
+        if "--platform" in subcmd:
+            index = subcmd.index("--platform") + 1
+            if index < len(subcmd):
+                platform = subcmd[index]
+        adapter = _platform_access_adapter(platform) if platform else None
+        if adapter:
+            proc = _run_platform_command(cmd, platform, env=env, timeout=timeout)
+        else:
+            proc = subprocess.run(cmd, cwd=str(PROJECT_ROOT), env=env,
+                                  capture_output=True, text=True, encoding="utf-8",
+                                  errors="replace", timeout=timeout)
     except subprocess.TimeoutExpired:
         return 3, {"error": f"超时（>{timeout}s）"}
     for line in reversed((proc.stdout or "").strip().splitlines()):
@@ -6152,7 +6216,7 @@ def _bench_fetch_one(bid: str) -> dict:
     if cookie_file:
         fetch_cmd += ["--cookie-file", cookie_file]      # 小红书：有 cookie 就纯 HTTP，不起浏览器
     code, payload = _bench_script(fetch_cmd, timeout=BENCH_FETCH_TIMEOUT)
-    risk = _xhs_mark_result(code, payload) if platform == "xiaohongshu" else ""
+    risk = _platform_mark_result(platform, code, payload)
 
     now = int(time.time())
     if risk:
@@ -6257,7 +6321,7 @@ async def _bench_run_sync(bid: str, platform: str, *, max_downloads: int) -> dic
     if cookie_file:
         args += ["--cookie-file", cookie_file]
     code, res = await _run_json_script(XHS_SYNC_SCRIPT, args, timeout=BENCH_SYNC_TIMEOUT)
-    risk = _xhs_mark_result(code, res)
+    risk = _platform_mark_result(platform, code, res)
     if risk:
         return {"risk": risk}
     if code != 0 or res.get("error"):
@@ -6266,10 +6330,12 @@ async def _bench_run_sync(bid: str, platform: str, *, max_downloads: int) -> dic
 
 
 async def _bench_run_fetch(bid: str, *, sync: bool = False, max_downloads: int | None = None) -> None:
-    _bench_write_status(bid, "queued", "等待小红书访问队列…")
+    _bench_write_status(bid, "queued", "等待平台访问队列…")
     try:
         fetch_platform = (next((a.get("platform") for a in _bench_read_accounts()
                                 if a.get("id") == bid), "") or "")
+        adapter = _platform_access_adapter(fetch_platform)
+        platform_name = adapter.policy.display_name if adapter else fetch_platform
         async with _platform_access(fetch_platform, f"抓取对标账号 {bid}"):
             _bench_write_status(bid, "running", "正在抓取公开主页…")
             acc = await _access_thread(_bench_fetch_one, bid)
@@ -6288,7 +6354,7 @@ async def _bench_run_fetch(bid: str, *, sync: bool = False, max_downloads: int |
                 budget = BENCH_SYNC_MAX_DOWNLOADS if max_downloads is None else max(0, max_downloads)
                 stats = await _bench_run_sync(bid, platform, max_downloads=budget)
                 if stats.get("risk"):
-                    _bench_write_status(bid, "risk", f"小红书风控熔断：{stats['risk']}")
+                    _bench_write_status(bid, "risk", f"{platform_name}访问暂停：{stats['risk']}")
                 elif stats.get("error"):
                     _bench_write_status(bid, "error", f"同步失败：{stats['error']}")
                 elif stats.get("total"):
@@ -6300,7 +6366,7 @@ async def _bench_run_fetch(bid: str, *, sync: bool = False, max_downloads: int |
                         msg += f"；还有 {stats['skipped_due_budget']} 条未下载（本次预算 {budget} 条）"
                     _bench_write_status(bid, "done", msg)
     except XHSRiskError as e:
-        _bench_write_status(bid, "risk", f"小红书风控熔断：{e}"[:200])
+        _bench_write_status(bid, "risk", f"平台访问暂停：{e}"[:200])
     except Exception as e:  # noqa: BLE001
         _bench_write_status(bid, "error", f"{type(e).__name__}: {e}"[:200])
     finally:
@@ -6583,12 +6649,14 @@ def _bench_pending_detail(works: list[dict]) -> list[dict]:
 
 
 async def _bench_run_detail_batch(bid: str, limit: int) -> None:
-    _bench_write_status(bid, "queued", "等待小红书访问队列…")
+    _bench_write_status(bid, "queued", "等待平台访问队列…")
+    account = next((a for a in _bench_read_accounts() if a.get("id") == bid), {})
+    platform = account.get("platform") or ""
     try:
-        async with _xhs_access(f"批量读取对标作品 {bid}"):
+        async with _platform_access(platform, f"批量读取对标作品 {bid}"):
             await _bench_run_detail_batch_core(bid, limit)
     except XHSRiskError as error:
-        _bench_write_status(bid, "risk", f"小红书风控熔断：{error}"[:200])
+        _bench_write_status(bid, "risk", f"平台访问暂停：{error}"[:200])
     except Exception as error:  # noqa: BLE001
         _bench_write_status(bid, "error", f"批量深挖中断：{type(error).__name__}: {error}"[:180])
     finally:
@@ -6621,7 +6689,7 @@ async def _bench_run_detail_batch_core(bid: str, limit: int) -> None:
                 + (["--cookie-file", cf] if (cf := _bench_cookie_file(platform)) else []),
                 BENCH_FETCH_TIMEOUT)
             err = str(res.get("error") or "")
-            risk_reason = _xhs_mark_result(code, res, err)
+            risk_reason = _platform_mark_result(acc.get("platform", ""), code, res, err)
             if risk_reason:
                 _bench_write_json(_bench_account_dir(bid) / "works.json", payload)
                 _bench_write_status(
@@ -6697,8 +6765,9 @@ async def api_bench_work_detail(bid: str, wid: str):
         raise HTTPException(400, "该作品缺少定位信息（平台未返回），无法深挖")
     if work.get("detail_fetched") and any(work.get(key) is not None for key in ("favorites", "comments")):
         return work
+    platform = acc.get("platform", "")
     try:
-        async with _xhs_access(f"读取作品详情 {wid}"):
+        async with _platform_access(platform, f"读取作品详情 {wid}"):
             payload = _bench_read_works(bid)
             work = next((entry for entry in payload.get("works", []) if str(entry.get("id")) == wid), None)
             if work is None:
@@ -6712,9 +6781,10 @@ async def api_bench_work_detail(bid: str, wid: str):
                  "--work-id", wid, "--xsec-token", token, "-q"]
                 + (["--cookie-file", cf] if (cf := _bench_cookie_file(acc.get("platform", ""))) else []),
                 BENCH_FETCH_TIMEOUT)
-            risk = _xhs_mark_result(code, res)
+            risk = _platform_mark_result(platform, code, res)
             if risk:
-                raise HTTPException(429, f"小红书访问已暂停：{risk}")
+                adapter = _platform_access_adapter(platform)
+                raise HTTPException(429, f"{adapter.policy.display_name}访问已暂停：{risk}")
             if code != 0 or res.get("error"):
                 raise HTTPException(502, str(res.get("error") or "深挖失败")[:240])
             got = any(res.get(key) is not None for key in ("likes", "favorites", "comments"))
@@ -6730,7 +6800,9 @@ async def api_bench_work_detail(bid: str, wid: str):
             _bench_write_json(_bench_account_dir(bid) / "works.json", payload)
             return work
     except XHSRiskError as error:
-        raise HTTPException(429, f"小红书访问已暂停：{error}") from None
+        adapter = _platform_access_adapter(platform)
+        name = adapter.policy.display_name if adapter else platform
+        raise HTTPException(429, f"{name}访问已暂停：{error}") from None
 
 
 # --------------------------------------------------------------------------- #
@@ -7012,7 +7084,7 @@ def _monitor_probe_detail(acc: dict, wid: str) -> dict:
         + (["--cookie-file", cf] if (cf := _bench_cookie_file(platform)) else []),
         BENCH_FETCH_TIMEOUT)
     err = str(res.get("error") or "")
-    breaker_reason = _xhs_mark_result(code, res, err)
+    breaker_reason = _platform_mark_result(platform, code, res, err)
     if breaker_reason:
         return {"error": breaker_reason[:160], "risk": True}
     if code != 0 or err:
@@ -7080,23 +7152,28 @@ def _monitor_targets(*, force: bool, only_bid: str | None = None,
 
 async def _bench_monitor_run(*, force: bool = False, bid: str | None = None,
                              wids: list[str] | None = None) -> None:
-    _monitor_write_status("queued", "等待小红书访问队列…", done=0, total=0)
+    _monitor_write_status("queued", "等待平台访问队列…", done=0, total=0)
     try:
-        monitor_accounts = _bench_read_accounts()
-        monitor_ids = {str(a.get("id")): a.get("platform") for a in monitor_accounts}
-        monitor_platform = "xiaohongshu" if any(
-            monitor_ids.get(str(item[0])) == "xiaohongshu"
-            for item in _monitor_targets(force=force, only_bid=bid, only_wids=wids)) else ""
-        async with _platform_access(monitor_platform, "作品表现监控"):
+        targets = _monitor_targets(force=force, only_bid=bid, only_wids=wids)
+        platforms = list(dict.fromkeys(acc.get("platform") or "" for _, acc, _ in targets))
+        if not platforms:
             await _bench_monitor_run_core(force=force, bid=bid, wids=wids)
-    except XHSRiskError as error:
-        _monitor_write_status("risk", f"小红书风控熔断：{error}"[:180], done=0, total=0)
+            return
+        for platform in platforms:
+            async with _platform_access(platform, f"{platform}作品表现监控"):
+                await _bench_monitor_run_core(
+                    force=force, bid=bid, wids=wids, platform=platform)
+            if _monitor_read_status().get("state") in ("risk", "error"):
+                return
+    except platform_access.AccessStopped as error:
+        _monitor_write_status("risk", f"平台访问已暂停：{error}"[:180], done=0, total=0)
     except Exception as error:  # noqa: BLE001
         _monitor_write_status("error", f"采样中断：{type(error).__name__}: {error}"[:180], done=0, total=0)
 
 
 async def _bench_monitor_run_core(*, force: bool = False, bid: str | None = None,
-                                  wids: list[str] | None = None) -> None:
+                                  wids: list[str] | None = None,
+                                  platform: str | None = None) -> None:
     """采一轮：把到期（或 force 指定）的作品各记一个点。
 
     - 小红书：逐条详情（1 条 = 1 个 HTTP 请求），条间用与深挖相同的对数正态间隔；
@@ -7105,6 +7182,8 @@ async def _bench_monitor_run_core(*, force: bool = False, bid: str | None = None
     """
     now = time.time()
     targets = _monitor_targets(force=force, only_bid=bid, only_wids=wids, now=now)
+    if platform is not None:
+        targets = [item for item in targets if (item[1].get("platform") or "") == platform]
     targets = targets[:BENCH_DETAIL_MAX]
     total = len(targets)
     if not targets:

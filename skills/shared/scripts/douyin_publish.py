@@ -160,7 +160,10 @@ def _launch(p, headed: bool, base: str | None, proxy: str | None):
     kwargs = dict(headless=not headed, locale="zh-CN", args=args)
     if proxy:
         kwargs["proxy"] = {"server": proxy}
-    return p.chromium.launch_persistent_context(str(profile), **kwargs)
+    context = p.chromium.launch_persistent_context(str(profile), **kwargs)
+    import platform_access
+    platform_access.install_browser_guard(context, platform="douyin")
+    return context
 
 
 def _wait_ready(page, timeout_ms: int = 15000) -> None:
@@ -1526,4 +1529,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    import platform_access
+    import platform_adapters
+    sys.exit(platform_access.run_cli(main, platform="douyin"))

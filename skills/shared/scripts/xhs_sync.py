@@ -110,7 +110,7 @@ def sync(works_file: Path, notes_dir: Path, *, cookie: str = "", max_downloads: 
             if isinstance(error, xhs_access.RequestBudgetExhausted):
                 stats["skipped_due_request_budget"] = total - position + 1
                 break
-            if isinstance(error, xhs_access.AccessStopped) or xhs_access.RISK_PATTERN.search(str(error)):
+            if isinstance(error, xhs_access.AccessStopped) or xhs_access.is_risk_error(error):
                 xhs_access.trip("平台校验信号，本轮停止")
                 write_json(works_file, payload)
                 stats.update(risk="平台校验信号，本轮停止", error=str(error))
@@ -146,7 +146,7 @@ def sync(works_file: Path, notes_dir: Path, *, cookie: str = "", max_downloads: 
                 progress(position, entry,
                          f"已下载素材 {len(ok)} 个（{round(sum(int(m.get('bytes') or 0) for m in ok) / 1048576, 1)}MB）")
             except Exception as error:  # noqa: BLE001
-                if isinstance(error, xhs_access.AccessStopped) or xhs_access.RISK_PATTERN.search(str(error)):
+                if isinstance(error, xhs_access.AccessStopped) or xhs_access.is_risk_error(error):
                     xhs_access.trip("平台校验信号，本轮停止")
                     write_json(works_file, payload)
                     stats.update(risk="平台校验信号，本轮停止", error=str(error))
@@ -201,7 +201,7 @@ def main(argv: list[str] | None = None) -> int:
                     help="lowest（默认，最低画质）/ best / 1080 等")
     ap.add_argument("-q", "--quiet", action="store_true")
     a = ap.parse_args(argv)
-    xhs_access._budget = max(0, a.max_requests)
+    xhs_access.set_budget(max(0, a.max_requests))
 
     cookie = ""
     if a.cookie_file:

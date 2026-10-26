@@ -1568,18 +1568,18 @@ textarea.field { resize: vertical; min-height: 90px; }
 }
 .bench-note.dim { background: transparent; color: var(--text-tertiary); padding: 4px 2px 0; }
 
-.xhs-access-bar {
+.platform-access-bar {
   max-width: var(--bench-w); margin: 10px auto 0; padding: 8px 11px;
   border: 1px solid rgba(22,163,74,.22); border-radius: 7px;
   background: rgba(22,163,74,.08); color: var(--text-secondary); font-size: 12px;
   line-height: 1.5;
 }
-.xhs-access-bar.risk {
+.platform-access-bar.risk {
   border-color: rgba(220,38,38,.25); background: rgba(220,38,38,.08); color: #991b1b;
 }
-.xhs-access-dot { display: inline-block; width: 7px; height: 7px; margin-right: 7px;
+.platform-access-dot { display: inline-block; width: 7px; height: 7px; margin-right: 7px;
   border-radius: 50%; background: #16a34a; vertical-align: 1px; }
-.xhs-access-bar.risk .xhs-access-dot { background: #dc2626; }
+.platform-access-bar.risk .platform-access-dot { background: #dc2626; }
 
 /* 作品列表的表头行（列表本体样式见文末「作品详情列表」） */
 .bench-works-head {

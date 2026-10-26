@@ -95,7 +95,7 @@ class Throttle:
         self.count = 0
 
     def wait(self) -> None:
-        if self.last_at is not None and not xhs_access._depth:
+        if self.last_at is not None and not xhs_access.active():
             delay = random.uniform(self.min_delay, self.max_delay)
             time.sleep(delay)
         self.last_at = time.time()
@@ -366,7 +366,7 @@ def fetch_profile_api(user_id: str, cookie: str, *, limit: int = 20,
                    f"获赞 {info.get('liked_exact')}，收藏 {info.get('collected_exact')}，"
                    f"作品 {info.get('posted_exact')}")
     except Exception as error:  # noqa: BLE001
-        if isinstance(error, xhs_access.AccessStopped) or xhs_access.RISK_PATTERN.search(str(error)):
+        if isinstance(error, xhs_access.AccessStopped) or xhs_access.is_risk_error(error):
             if isinstance(error, xhs_access.RequestBudgetExhausted):
                 raise
             raise xhs_access.AccessStopped("账号指标触发平台校验，本轮停止") from error
@@ -382,7 +382,7 @@ def fetch_profile_api(user_id: str, cookie: str, *, limit: int = 20,
         if paged.get("risk_control"):
             raise xhs_access.AccessStopped(f"列表接口命中风控信号：{paged['risk_control']}")
     except Exception as error:  # noqa: BLE001
-        if isinstance(error, xhs_access.AccessStopped) or xhs_access.RISK_PATTERN.search(str(error)):
+        if isinstance(error, xhs_access.AccessStopped) or xhs_access.is_risk_error(error):
             if isinstance(error, xhs_access.RequestBudgetExhausted):
                 raise
             raise xhs_access.AccessStopped("作品列表触发平台校验，本轮停止") from error
@@ -857,7 +857,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--json", dest="json_out", help="把结果写到该文件")
     ap.add_argument("-q", "--quiet", action="store_true")
     a = ap.parse_args(argv)
-    xhs_access._budget = max(1, a.request_budget)
+    xhs_access.set_budget(max(1, a.request_budget))
 
     if not re.fullmatch(r"[0-9a-f]{24}", a.user_id or ""):
         print(f"user_id 格式不对（需 24 位十六进制）：{a.user_id}")

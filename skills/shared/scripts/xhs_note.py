@@ -318,15 +318,13 @@ def _download(urls, dest: Path, *, referer: str, limit: int = MAX_FILE_BYTES) ->
         result["tries"] += 1
         response = None
         try:
-            if xhs_access._depth:
+            if xhs_access.active():
                 xhs_access.check_breaker()
             result["url"] = url
             # 注意：curl_cffi 的 Response 不支持 with 语句（实测 TypeError），手动关闭
             response = creq.get(url, headers={"referer": referer}, timeout=180, verify=False,
                                 allow_redirects=True, impersonate="chrome", stream=True)
-            if response.status_code in (429, 461):
-                xhs_access.trip(f"HTTP {response.status_code}")
-                raise xhs_access.AccessStopped(f"HTTP {response.status_code}")
+            xhs_access.inspect_status(response)
             if response.status_code not in (200, 206):
                 last_error = f"HTTP {response.status_code}"
                 continue

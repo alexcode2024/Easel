@@ -778,17 +778,20 @@ export interface BenchStatus {
   cooldown_left?: number;
 }
 
-export interface XhsAccessStatus {
-  resource: 'xiaohongshu';
-  concurrency: 1;
+export interface PlatformAccessStatus {
+  resource: string;
+  platform: string;
+  platform_name: string;
+  concurrency: number;
   active: { id: string; label: string; started_at: number } | null;
-  queue: { id: string; label: string; state: 'queued'; position: number; queued_at: number }[];
+  external_busy: boolean;
+  queue: { id: string; platform: string; label: string; state: 'queued'; position: number; queued_at: number }[];
   queued: number;
   risk: { active: boolean; until: number; reason: string; triggered_at: number };
 }
 
-export function fetchXhsAccessStatus(): Promise<XhsAccessStatus> {
-  return request('/api/xhs/access/status');
+export function fetchPlatformAccessStatus(): Promise<Record<string, PlatformAccessStatus>> {
+  return request('/api/platform-access/status');
 }
 
 export interface BenchAccount {
