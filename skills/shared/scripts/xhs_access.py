@@ -14,6 +14,8 @@ ROOT = Path(__file__).resolve().parents[3]
 STATE_FILE = ROOT / "outputs" / "_benchmarks" / "xhs_access.json"
 LOCK_FILE = ROOT / "outputs" / "_locks" / "xhs-session.lock"
 PACE_FILE = ROOT / "outputs" / "_locks" / "xhs-requests.json"
+REQUEST_DELAY_MIN = 8.0
+REQUEST_DELAY_MAX = 15.0
 RISK_PATTERN = re.compile(r"300012|NeedVerify|verify_page|captcha|验证码|访问频繁|IP存在风险|请切换可靠网络环境|风控|风险|HTTP\s*(?:429|461)\b", re.I)
 _depth = 0
 _requests = 0
@@ -138,7 +140,7 @@ def request(call, *args, **kwargs):
     if _requests >= _budget:
         raise RequestBudgetExhausted("本轮请求预算已用完，停止访问")
     previous = float(read_state(PACE_FILE).get("finished_at") or time.time())
-    time.sleep(max(0, previous + random.uniform(10, 30) - time.time()))
+    time.sleep(max(0, previous + random.uniform(REQUEST_DELAY_MIN, REQUEST_DELAY_MAX) - time.time()))
     check_breaker()
     _requests += 1
     try:

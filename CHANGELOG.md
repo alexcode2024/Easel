@@ -13,6 +13,7 @@ All notable changes to Easel are documented in this file.
 
 ### Fixed
 
+- Unified the shared Xiaohongshu request interval and fetch defaults at a random 8–15 seconds; single-account concurrency remains one, with existing request budgets and risk cooldown unchanged.
 - Fixed custom OpenClaw providers being reported as unconfigured when their primary model's API key is stored in OpenClaw rather than `.env`; malformed configuration still falls back to valid environment-file credentials.
 - Fixed saved chat-model settings not taking effect in a running OpenClaw gateway: the settings panel now restarts the gateway after saving and reports restart failures without resubmitting the saved configuration. Direct-API and media configuration saves do not restart it.
 - Fixed Linux gateway restarts escaping systemd supervision: deployments using `EASEL_GATEWAY_SYSTEMD=1` restart the fixed `easel-gateway.service` user unit instead of spawning an unmanaged replacement.

@@ -26,16 +26,15 @@ Design notes (why it looks like this)
    retry through a block -- that turns soft throttling into an hours-long ban.
 
 4. Throttling.  Serial only, one request in flight, random jitter between
-   requests. Defaults to the Steady band (20 s +/- 50%, i.e. 10-30 s) documented
-   in skill-xhs-analyzer/references/research-loop.md. Faster pacing is possible
-   via ``--min-delay`` / ``--max-delay`` but prints a risk warning; the safety
+   requests. Defaults to the shared random 8-15 s request interval. Faster pacing
+   is possible via ``--min-delay`` / ``--max-delay`` but prints a risk warning; the safety
    reference classes anything under 5 s as needing explicit user consent.
 
 Usage
 -----
     python xhs_fetch.py --user-id 55753cf4f5a2633511d5a652 [--limit 20]
                         [--details N] [--json OUT]
-                        [--min-delay 10] [--max-delay 30]
+                        [--min-delay 8] [--max-delay 15]
                         [--anonymous] [--no-fallback]
 
 Exit codes: 0 ok (partial counts as ok, see "complete"), 2 risk-control stop,
@@ -61,13 +60,8 @@ PROFILE_ROOT = Path.home() / ".easel-browser-profiles"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
-# Pacing bands from skill-xhs-analyzer/references/research-loop.md:
-#   Steady (default)  20 s +/- 50%  -> 10-30 s
-#   Fast (opt-in)     >= 5 s, burst-capped, requires the user's explicit consent
-# Defaults stay in Steady. Going faster prints a warning rather than failing,
-# because the operator may knowingly accept the risk.
-STEADY_MIN = 10.0
-STEADY_MAX = 30.0
+STEADY_MIN = xhs_access.REQUEST_DELAY_MIN
+STEADY_MAX = xhs_access.REQUEST_DELAY_MAX
 FAST_CEILING = 5.0
 DEFAULT_REQUEST_BUDGET = 8
 

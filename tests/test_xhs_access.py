@@ -164,12 +164,20 @@ def test_refresh_defaults_are_list_only():
     assert inspect.signature(web._bench_run_fetch).parameters["sync"].default is False
     assert web.BENCH_DETAIL_MAX == 20
     assert web.BENCH_SYNC_MAX_DOWNLOADS == 5
+    assert (fetch.STEADY_MIN, fetch.STEADY_MAX) == (8, 15)
 
 
-def test_script_request_pacing_and_budget(monkeypatch):
+@pytest.mark.parametrize("delay", [8, 15])
+def test_script_request_pacing_and_budget(monkeypatch, delay):
     waits, calls = [], []
+
+    def uniform(minimum, maximum):
+        assert (minimum, maximum) == (8, 15)
+        return delay
+
     monkeypatch.setattr(safety.time, "sleep", waits.append)
-    monkeypatch.setattr(safety.random, "uniform", lambda *args: 10)
+    monkeypatch.setattr(safety.time, "time", lambda: 100)
+    monkeypatch.setattr(safety.random, "uniform", uniform)
     monkeypatch.setattr(safety, "_budget", 1)
 
     def request():
@@ -181,7 +189,7 @@ def test_script_request_pacing_and_budget(monkeypatch):
         with pytest.raises(safety.RequestBudgetExhausted):
             safety.request(request)
     assert len(calls) == 1
-    assert waits[0] > 9
+    assert waits == [delay]
     assert not safety.read_state(safety.STATE_FILE).get("risk_until")
 
 

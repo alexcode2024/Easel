@@ -400,7 +400,7 @@ export default function BenchmarksPage({ onAskAgent, onBreakdown }: BenchmarksPa
                   w.detail_fetched && (w.favorites !== null || w.comments !== null))).length;
                 if (pending === 0) return null;
                 const batchSize = Math.min(pending, 20);
-                const mins = Math.max(1, Math.ceil(batchSize * 26 / 60));
+                const mins = Math.max(1, Math.ceil(batchSize * 18 / 60));
                 return (
                   <button className="btn btn-sm" onClick={deepDiveBatch}
                     disabled={detail.account.running || detail.fetch?.state === 'running'}
