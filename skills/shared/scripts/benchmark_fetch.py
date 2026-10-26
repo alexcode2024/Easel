@@ -611,7 +611,13 @@ class DouyinAdapter(Adapter):
     def parse_target(self, raw: str) -> str:
         return parse_target_douyin(raw)
 
-    def fetch(self, target, *, limit, profile_root, proxy, cover_dir, verbose):
+    def fetch(self, target, *, limit, profile_root, proxy, cover_dir, verbose,
+              cookie_file=None):
+        """打开他人主页，拦页面自身发出的接口响应。
+
+        ``cookie_file`` 只为与 ``cmd_fetch`` 的调用约定对齐（每个适配器都收这个关键字）：
+        抖音的登录态来自「自有账号」页扫码后的持久化浏览器 profile，不走 cookie 文件。
+        """
         limit = max(1, min(int(limit or 12), 50))
         from playwright.sync_api import sync_playwright
 
@@ -977,7 +983,14 @@ class TiktokAdapter(Adapter):
     def parse_target(self, raw: str) -> str:
         return parse_target_tiktok(raw)
 
-    def fetch(self, target, *, limit, profile_root, proxy, cover_dir, verbose):
+    def fetch(self, target, *, limit, profile_root, proxy, cover_dir, verbose,
+              cookie_file=None):
+        """打开他人主页，拦页面自身的 item_list 响应。
+
+        ``cookie_file`` 只为与 ``cmd_fetch`` 的调用约定对齐（每个适配器都收这个关键字）：
+        TikTok 的登录态走 ``~/.easel-browser-profiles/TikTokProfile`` 持久化 profile，
+        匿名也能读公开主页，所以这里不消费 cookie 文件。
+        """
         limit = max(1, min(int(limit or 20), 50))
         from playwright.sync_api import sync_playwright
 

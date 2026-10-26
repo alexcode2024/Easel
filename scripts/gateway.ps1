@@ -98,14 +98,20 @@ switch ($args[0]) {
         Start-Process powershell -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-Command', $command `
             -WorkingDirectory $Root -RedirectStandardOutput $LogFile -RedirectStandardError $ErrorLogFile -WindowStyle Hidden | Out-Null
         $ready = $false
-        1..20 | ForEach-Object {
-            if (-not $ready) {
-                if (Test-Gateway) { $ready = $true }
-                else { Start-Sleep -Seconds 1 }
-            }
+        # OpenClaw 冷启动要加载十几个插件、跑一遍 state schema preflight，实测 60-90 秒
+        # （2026-10 本机：15:51:43 起，healthz 约 15:52:50 才通）。这里原来只等 20 秒，
+        # 于是「其实起来了」却报「Gateway 启动失败」——现在与 gateway.sh 的轮询语义对齐，
+        # 并把上限放宽到 180 秒。
+        for ($i = 1; $i -le 360; $i++) {
+            if (Test-Gateway) { $ready = $true; break }
+            Start-Sleep -Milliseconds 500
         }
         if ($ready) { Write-Host '[easel] Gateway started' }
-        else { Write-Error "Gateway 启动失败；请检查 $LogFile 和 $ErrorLogFile"; exit 1 }
+        else {
+            Write-Error ("Gateway 180 秒内未就绪；它可能仍在启动，先看 $LogFile 与 $ErrorLogFile" +
+                         "（若 healthz 随后变通，可忽略本提示）")
+            exit 1
+        }
     }
     'stop' { Stop-Gateway }
     'restart' { Stop-Gateway; Start-Sleep -Seconds 2; & $PSCommandPath start }

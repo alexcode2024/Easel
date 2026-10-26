@@ -1,4 +1,4 @@
-# Easel launcher.
+﻿# Easel launcher.
 #
 # Why this exists: this machine has a corrupted machine-level COMSPEC
 #   COMSPEC = C:\WINDOWS\system32\cmd.exe;<...>\ffmpeg-master...\bin

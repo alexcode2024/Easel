@@ -4,6 +4,7 @@
 真实抓取路径由 skills/shared/scripts/benchmark_fetch.py 的 selftest 与手工实测覆盖。
 """
 import asyncio
+import inspect
 import json
 import sys
 from pathlib import Path
@@ -133,6 +134,21 @@ def test_douyin_zero_play_count_is_unknown_not_zero():
     assert bf._public_plays(None) is None
     assert bf._public_plays("0") is None
     assert bf._public_plays(12345) == 12345
+
+
+@pytest.mark.parametrize("key", ["xiaohongshu", "douyin", "tiktok"])
+def test_every_adapter_fetch_accepts_the_cmd_fetch_keywords(key):
+    """``cmd_fetch`` 统一按关键字传参：任何适配器少一个关键字都会在刷新时炸掉。
+
+    2026-10-17 实测踩到：抖音/TikTok 的 ``fetch()`` 签名里没有 ``cookie_file``，
+    一刷新就 `TypeError: TiktokAdapter.fetch() got an unexpected keyword argument
+    'cookie_file'`——小红书有 cookie 走 HTTP，这两个平台只是**收下不消费**，
+    但签名必须与调用点一致。
+    """
+    adapter = bf.get_adapter(key)
+    kwargs = {"limit": 20, "profile_root": Path("."), "proxy": None, "cover_dir": None,
+              "verbose": False, "cookie_file": None}
+    inspect.signature(adapter.fetch).bind("target", **kwargs)   # 不抛 TypeError 即通过
 
 
 # --------------------------------------------------------------------------- #
