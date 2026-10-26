@@ -615,7 +615,11 @@ export interface BenchPlatformFields {
   work_likes?: boolean;
   work_favorites?: boolean;
   work_comments?: boolean;
+  /** 作品播放量（= 阅读/观看次数）：只有 TikTok 这类平台公开。 */
+  work_plays?: boolean;
   work_published_at?: boolean;
+  /** 作品级收藏/评论需要逐条打开作品页读（小红书）。 */
+  work_detail_manual?: boolean;
 }
 
 export interface BenchPlatform {
@@ -653,6 +657,117 @@ export interface BenchWork {
   downloaded?: boolean;
   downloading?: boolean;
   download?: BenchWorkDownload;
+  /** 表现监控摘要（开关状态 + 已记录几天 + 最近一个采样点）。 */
+  monitor?: BenchMonitorSummary;
+}
+
+/** 一次按日采样：平台当时给的累计数；没读到的字段是 null（不估算）。 */
+export interface BenchMonitorPoint {
+  day: string;
+  ts: number;
+  likes: number | null;
+  favorites: number | null;
+  comments: number | null;
+  /** 播放量（阅读/观看次数）：只有平台公开时才有值（TikTok），其余是 null。 */
+  plays?: number | null;
+  ok: boolean;
+  error?: string;
+}
+
+/** 单篇作品的监控状态（最多连续记录 window_days 天）。 */
+export interface BenchMonitorSummary {
+  enabled: boolean;
+  expired: boolean;
+  /** 窗口内已经采到的天数。 */
+  days: number;
+  window_days: number;
+  started_at: number;
+  /** 监控窗口的最后一天（含）：过完这天自动停止。 */
+  end_day: string;
+  last_ts: number;
+  last_error: string;
+  last: {
+    day: string; ts: number; likes: number | null; favorites: number | null;
+    comments: number | null; plays?: number | null; ok: boolean; error: string;
+  } | null;
+}
+
+export interface BenchTrendRow {
+  day: string;
+  value: number | null;
+  /** 那天有没有采样（没采到就是 false，折线在那里断开）。 */
+  sampled: boolean;
+  ok: boolean;
+}
+
+export interface BenchTrendStats {
+  first: number | null;
+  last: number | null;
+  delta: number | null;
+  pct: number | null;
+  count: number;
+  first_day: string;
+  last_day: string;
+}
+
+/** 指标键：播放量只在平台公开时出现（TikTok），所以是可选的第四条。 */
+export type BenchTrendKey = 'likes' | 'favorites' | 'comments' | 'plays';
+
+export interface BenchTrendSeries {
+  key: BenchTrendKey;
+  label: string;
+  /** 平台是否公开这个指标（不公开就别画空图，直接说明）。 */
+  available: boolean;
+  rows: BenchTrendRow[];
+  stats: BenchTrendStats;
+}
+
+/** 单篇作品最近 N 天的表现趋势（点赞/收藏/评论，平台公开播放量时多一条）。 */
+export interface BenchTrend {
+  work: {
+    id: string; title: string; url: string; cover_path: string;
+    published_at_ms: number | null;
+    current: { likes: number | null; favorites: number | null; comments: number | null; plays: number | null };
+  };
+  account: { id: string; nickname: string; platform: string; platform_name: string };
+  available: { likes: boolean; favorites: boolean; comments: boolean; plays: boolean };
+  monitor: BenchMonitorSummary;
+  days: number;
+  window_days: number;
+  /** 今天（「YYYY-MM-DD」）：右端只有确实是今天时才标「（今天）」。 */
+  today: string;
+  /** 实际画出来的 x 轴区间（从第一个有记录的日子起，最多 15 个刻度）。 */
+  axis: { start_day: string; end_day: string; slots: number };
+  points: BenchMonitorPoint[];
+  series: BenchTrendSeries[];
+  schedule: { hour: number; minute: number };
+  next_run_ts: number;
+  run: { state: string; message: string; done: number; total: number; ts: number; running: boolean };
+}
+
+/** 采样进度（手动刷新/每日采样期间轮询）。 */
+export interface BenchMonitorStatus {
+  state: string;
+  message: string;
+  done: number;
+  total: number;
+  ts: number;
+  running: boolean;
+  next_run_ts: number;
+  schedule: { hour: number; minute: number; window_days?: number };
+}
+
+/** 监控的全局设置：每天几点采样 + 监控数量统计。 */
+export interface BenchMonitorSchedule {
+  hour: number;
+  minute: number;
+  window_days: number;
+  next_run_ts: number;
+  last_run: { state: string; message: string; done: number; total: number; ts: number };
+  running: boolean;
+  monitored: number;
+  expired: number;
+  monitor_accounts: number;
 }
 
 export interface BenchStatus {
@@ -694,6 +809,8 @@ export interface BenchAccount {
   fetch?: BenchStatus;
   cooldown_left?: number;
   running?: boolean;
+  /** 该账号下开了监控的作品数（监控中的 / 已到期的 / 曾开过的总数）。 */
+  monitor?: { monitored: number; expired: number; total: number };
 }
 
 export interface BenchDetail {
@@ -821,6 +938,55 @@ export function fetchBenchmarkWorksDetailBatch(id: string, limit = 0): Promise<{
 }> {
   return request(`/api/benchmarks/${encodeURIComponent(id)}/works/detail-batch?limit=${limit}`,
     { method: 'POST' });
+}
+
+// ---- 作品表现监控（每篇作品每天采一次，最多连续 15 天）----
+
+/** 单篇作品最近 N 天（默认 15）的点赞/收藏/评论趋势。 */
+export function fetchWorkTrend(id: string, workId: string, days = 15): Promise<BenchTrend> {
+  return request(`/api/benchmarks/${encodeURIComponent(id)}/works/${encodeURIComponent(workId)}`
+    + `/trend?days=${days}`);
+}
+
+/** 开/关某篇作品的监控。开启时后端会顺手记下今天的第一个点（列表型平台除外）。 */
+export function toggleWorkMonitor(id: string, workId: string, enabled: boolean): Promise<{
+  monitor: BenchMonitorSummary; sampled: boolean; message: string; next_run_ts: number;
+}> {
+  return request(`/api/benchmarks/${encodeURIComponent(id)}/works/${encodeURIComponent(workId)}`
+    + '/monitor', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled }),
+  });
+}
+
+/** 监控设置：每天几点采样 + 下一次采样时间 + 当前监控数。 */
+export function fetchMonitorSchedule(): Promise<BenchMonitorSchedule> {
+  return request('/api/benchmarks/monitor/schedule');
+}
+
+/** 改「每天固定几点采样」（0-23 / 0-59）。 */
+export function saveMonitorSchedule(hour: number, minute: number): Promise<{
+  hour: number; minute: number; window_days: number; next_run_ts: number;
+}> {
+  return request('/api/benchmarks/monitor/schedule', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ hour, minute }),
+  });
+}
+
+/** 采样进度（采样期间轮询）。 */
+export function fetchMonitorStatus(): Promise<BenchMonitorStatus> {
+  return request('/api/benchmarks/monitor/status');
+}
+
+/** 立刻采一轮（force=true 覆盖今天的点）；可只针对一个账号。 */
+export function runMonitorNow(id?: string): Promise<{
+  state: string; total?: number; message?: string; reused?: boolean;
+}> {
+  const q = id ? `?force=true&bid=${encodeURIComponent(id)}` : '?force=true';
+  return request(`/api/benchmarks/monitor/run${q}`, { method: 'POST' });
 }
 
 /** 用户显式停止：终止后端正在跑的对话 agent，释放会话锁，令下一句能立刻发。 */

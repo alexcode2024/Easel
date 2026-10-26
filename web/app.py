@@ -441,7 +441,11 @@ async def _lifespan(_app: FastAPI):
     """应用生命周期：关机时回收公众号扫码进程（替代已弃用的 on_event）。"""
     global _HARNESS_LOOP
     _HARNESS_LOOP = asyncio.get_running_loop()
+    # 对标账号的作品监控：每天固定时刻采一次（服务没在跑就启动后补采）。定义在文件末尾，
+    # 这里按名调用——模块此时已完整加载，不依赖定义顺序。
+    _bench_monitor_loop_start()
     yield
+    await _bench_monitor_loop_stop()
     tasks = list(_HARNESS_TASKS)
     for task in tasks:
         task.cancel()
@@ -5824,8 +5828,12 @@ def _bench_script(subcmd: list[str], timeout: int = 30) -> tuple[int, dict]:
     env = _proxy_env()
     env.update(PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
     try:
+        # 显式按 UTF-8 解码，不跟随 locale：Windows 默认 GBK 时会 UnicodeDecodeError，
+        # 整个平台能力矩阵就变成空列表（`easel web` 设了 PYTHONUTF8=1 才没暴露）。
+        # 与 _run_json_script 保持同一套解码约定。
         proc = subprocess.run(cmd, cwd=str(PROJECT_ROOT), env=env,
-                              capture_output=True, text=True, timeout=timeout)
+                              capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", timeout=timeout)
     except subprocess.TimeoutExpired:
         return 3, {"error": f"超时（>{timeout}s）"}
     for line in reversed((proc.stdout or "").strip().splitlines()):
@@ -6085,12 +6093,22 @@ async def api_bench_platforms():
 async def api_bench_list():
     """对标账号列表（读本地快照，绝不在这里触发抓取）。"""
     accounts = _bench_read_accounts()
+    now = time.time()
     out = []
     for a in accounts:
         item = dict(a)
         item["fetch"] = _bench_read_status(a.get("id", ""))
         item["cooldown_left"] = _bench_cooldown_left(a.get("id", ""))
         item["running"] = a.get("id") in BENCH_RUNNING
+        data = _monitor_read(str(a.get("id") or "")) if a.get("id") else {"works": {}}
+        if _monitor_sweep(data, now):
+            _monitor_write(str(a.get("id") or ""), data)
+        watches = [w for w in (data.get("works") or {}).values() if isinstance(w, dict)]
+        item["monitor"] = {
+            "monitored": sum(1 for w in watches if w.get("enabled")),
+            "expired": sum(1 for w in watches if w.get("expired")),
+            "total": len(watches),
+        }
         out.append(item)
     return out
 
@@ -6160,6 +6178,15 @@ async def api_bench_detail(bid: str):
         raise HTTPException(404, "对标账号不存在")
     works = _bench_read_works(bid)
     rows = works.get("works") or []
+    now = time.time()
+    # 每篇作品带上监控摘要（开关状态 + 已记录几天 + 最近一个点），作品卡据此渲染开关，
+    # 不用前端逐条再请求（15 条作品 = 15 个请求，纯属浪费）。
+    monitor_data = _monitor_read(bid)
+    if _monitor_sweep(monitor_data, now):
+        _monitor_write(bid, monitor_data)
+    for w in rows:
+        watch = (monitor_data.get("works") or {}).get(str(w.get("id") or ""))
+        w["monitor"] = _monitor_summary(watch if isinstance(watch, dict) else None, now)
     if acc.get("platform") == "xiaohongshu":
         # 每条的下载状态（有没有下过、下了多少文件），供作品卡显示按钮状态
         for w in rows:
@@ -6404,6 +6431,740 @@ async def api_bench_work_detail(bid: str, wid: str):
                                 or "没读到互动数据（笔记可能已删除或页面改版）")
     _bench_write_json(_bench_account_dir(bid) / "works.json", payload)
     return work
+
+
+# --------------------------------------------------------------------------- #
+# 作品表现监控（15 天趋势）：单篇作品开监控 → 每天固定时刻采一次点赞/收藏/评论
+# --------------------------------------------------------------------------- #
+# 平台给的互动数是**累计快照**，没有历史接口——想要趋势就只能自己按天记一笔，所以这里落的
+# 是时间序列，不是聚合值。既有红线照旧：不估算（当天没读到就留空，不插值）、不并发
+# （串行 + 抖动间隔）、命中风控立即停手（不重试）。
+#
+# 存储（都以 _ 开头 → 不进内容库）：
+#   outputs/_benchmarks/monitor_schedule.json   全局设置：每天几点采样
+#   outputs/_benchmarks/<bid>/monitor.json      该账号下每篇作品的采样序列
+#   outputs/_benchmarks/monitor_run.json        当前/最近一轮采样的进度（前端轮询它）
+BENCH_MONITOR_DAYS = 15            # 连续记录上限（含开始当天）
+BENCH_MONITOR_MAX_POINTS = 30      # 落盘保留上限：窗口外的老点留着，重开监控不必从零攒
+BENCH_MONITOR_TICK = 60            # 调度器检查间隔（秒）：到点后 1 分钟内开始采样
+BENCH_MONITOR_STARTUP_DELAY = 5    # 启动后先等几秒再开始检查，别和启动期抢资源
+BENCH_MONITOR_DEFAULT_HOUR = 9     # 默认每天 09:00（本地时区）
+BENCH_MONITOR_DEFAULT_MINUTE = 0
+BENCH_MONITOR_TASK: asyncio.Task | None = None        # 正在跑的那轮采样
+BENCH_MONITOR_LOOP_TASK: asyncio.Task | None = None   # 常驻调度循环
+_BENCH_RISK_RE = re.compile(r"风控|风险|300012|461")
+
+
+# ---- 路径：每次现算 ------------------------------------------------
+# 测试会把 BENCH_DIR 指到 tmp 目录；写成模块级常量会绕开这个隔离，直接写进真实 outputs。
+def _monitor_schedule_file() -> Path:
+    return BENCH_DIR / "monitor_schedule.json"
+
+
+def _monitor_run_file() -> Path:
+    return BENCH_DIR / "monitor_run.json"
+
+
+def _monitor_file(bid: str) -> Path:
+    return _bench_account_dir(bid) / "monitor.json"
+
+
+# ---- 固定采样时间 ----
+def _monitor_read_schedule() -> dict:
+    hour, minute = BENCH_MONITOR_DEFAULT_HOUR, BENCH_MONITOR_DEFAULT_MINUTE
+    fp = _monitor_schedule_file()
+    if fp.is_file():
+        try:
+            data = json.loads(fp.read_text(encoding="utf-8"))
+            hour = int(data.get("hour", hour))
+            minute = int(data.get("minute", minute))
+        except Exception:  # noqa: BLE001 - 坏设置退回默认值，不能因此停掉采样
+            hour, minute = BENCH_MONITOR_DEFAULT_HOUR, BENCH_MONITOR_DEFAULT_MINUTE
+    return {"hour": min(23, max(0, hour)), "minute": min(59, max(0, minute)),
+            "window_days": BENCH_MONITOR_DAYS}
+
+
+def _monitor_write_schedule(hour: int, minute: int) -> dict:
+    _bench_write_json(_monitor_schedule_file(),
+                      {"hour": min(23, max(0, int(hour))), "minute": min(59, max(0, int(minute)))})
+    return _monitor_read_schedule()
+
+
+def _monitor_day(ts: float | None = None) -> str:
+    """时间戳 → 本地日期「YYYY-MM-DD」。采样按**自然日**归档，一天一条。"""
+    return time.strftime("%Y-%m-%d", time.localtime(time.time() if ts is None else ts))
+
+
+def _monitor_day_ts(day: str) -> float:
+    try:
+        return time.mktime(time.strptime(day, "%Y-%m-%d"))
+    except (ValueError, OverflowError):
+        return 0.0
+
+
+def _monitor_at(day_ts: float, hour: int, minute: int) -> float:
+    """某天 00:00 的时间戳 → 该天的固定采样时刻（跨夏令时也落在同一自然日）。"""
+    lt = time.localtime(day_ts)
+    return time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, hour, minute, 0,
+                        lt.tm_wday, lt.tm_yday, -1))
+
+
+def _monitor_today_at(now: float) -> float:
+    """今天的固定采样时刻。"""
+    st = _monitor_read_schedule()
+    return _monitor_at(_monitor_day_ts(_monitor_day(now)), st["hour"], st["minute"])
+
+
+def _monitor_next_run_ts(now: float | None = None) -> float:
+    """下一次自动采样的时间戳（今天还没到点就是今天，否则明天）。"""
+    now = time.time() if now is None else now
+    at = _monitor_today_at(now)
+    if at > now:
+        return at
+    hour, minute = _monitor_hourminute()
+    return _monitor_at(_monitor_day_ts(_monitor_day(at + 86400)), hour, minute)
+
+
+def _monitor_hourminute() -> tuple[int, int]:
+    st = _monitor_read_schedule()
+    return st["hour"], st["minute"]
+
+
+# ---- 存储 ----
+def _monitor_read(bid: str) -> dict:
+    fp = _monitor_file(bid)
+    data: dict = {}
+    if fp.is_file():
+        try:
+            raw = json.loads(fp.read_text(encoding="utf-8"))
+            data = raw if isinstance(raw, dict) else {}
+        except Exception:  # noqa: BLE001 - 坏文件从空开始，别把整个账号的监控卡死
+            data = {}
+    if not isinstance(data.get("works"), dict):
+        data["works"] = {}
+    return data
+
+
+def _monitor_write(bid: str, data: dict) -> None:
+    _bench_write_json(_monitor_file(bid), data)
+
+
+# ---- 监控窗口与到期 ----
+def _monitor_window(watch: dict, now: float | None = None) -> tuple[str, str]:
+    """监控窗口 [开始日, 结束日]（含两端；共 BENCH_MONITOR_DAYS 天）。"""
+    now = time.time() if now is None else now
+    started = float(watch.get("started_at") or 0) or now
+    start_day = _monitor_day(started)
+    end_day = _monitor_day(_monitor_day_ts(start_day) + (BENCH_MONITOR_DAYS - 1) * 86400)
+    return start_day, end_day
+
+
+def _monitor_expired(watch: dict, now: float | None = None) -> bool:
+    """连续记录满 15 天（今天已超出窗口）即到期。
+
+    不用定时器判定，而是每次读取时按**日期**算——进程重启、机器休眠都不会让状态漂。
+    """
+    now = time.time() if now is None else now
+    _, end_day = _monitor_window(watch, now)
+    return _monitor_day(now) > end_day
+
+
+def _monitor_window_points(watch: dict, now: float | None = None) -> list[dict]:
+    """窗口内的有效采样点（窗口外的老点只留在文件里，不参与趋势与计数）。"""
+    now = time.time() if now is None else now
+    start_day, end_day = _monitor_window(watch, now)
+    rows = [p for p in (watch.get("points") or [])
+            if isinstance(p, dict) and start_day <= str(p.get("day") or "") <= end_day]
+    return sorted(rows, key=lambda p: str(p.get("day") or ""))
+
+
+def _monitor_sweep(data: dict, now: float | None = None) -> bool:
+    """把到期的监控自动关掉（返回是否有改动）。
+
+    界面上的开关因此会自己变为「已到期」——不需要用户回来手动关，
+    也不会在第 16 天继续打平台（那属于「多记一天」，与 15 天上限不符）。
+    """
+    now = time.time() if now is None else now
+    changed = False
+    for watch in (data.get("works") or {}).values():
+        if not isinstance(watch, dict):
+            continue
+        if watch.get("enabled") and _monitor_expired(watch, now):
+            watch["enabled"] = False
+            watch["expired"] = True
+            watch["stopped_at"] = int(now)
+            changed = True
+    return changed
+
+
+def _monitor_due(watch: dict, now: float | None = None) -> bool:
+    """今天是否还欠一次采样：开了监控、没到期、过了固定时刻、今天还没采过。"""
+    now = time.time() if now is None else now
+    if not watch.get("enabled") or _monitor_expired(watch, now):
+        return False
+    if now < _monitor_today_at(now):
+        return False
+    today = _monitor_day(now)
+    return not any(str(p.get("day") or "") == today for p in (watch.get("points") or [])
+                   if isinstance(p, dict))
+
+
+def _monitor_record(watch: dict, *, likes, favorites, comments, plays=None, error: str = "",
+                    now: float | None = None) -> dict:
+    """记一次采样（同一天只留一条：后来的一次覆盖先前，避免一天出现多个点）。
+
+    采样失败也记（`ok=false` + 原因）：图上留缺口比抹掉更有信息量，也避免每分钟重试打平台。
+    但**今天已经采到过数据时，不许被一次失败覆盖**——把真实读到的数字换成空值等于丢数据，
+    只更新 `last_error` 让人知道这天的重采失败了。
+    ``plays`` 只有平台公开播放量时才有值（TikTok），其余平台留 None。
+    """
+    now = time.time() if now is None else now
+    day = _monitor_day(now)
+    points = [p for p in (watch.get("points") or [])
+              if isinstance(p, dict) and str(p.get("day") or "") != day]
+    previous = next((p for p in (watch.get("points") or [])
+                     if isinstance(p, dict) and str(p.get("day") or "") == day), None)
+    if error and previous and previous.get("ok"):
+        watch["last_run"] = int(now)
+        watch["last_error"] = error[:160]
+        return watch
+    point = {"day": day, "ts": int(now), "likes": likes, "favorites": favorites,
+             "comments": comments, "plays": plays, "ok": not error,
+             "error": (error or "")[:120]}
+    points.append(point)
+    points.sort(key=lambda p: str(p.get("day") or ""))
+    watch["points"] = points[-BENCH_MONITOR_MAX_POINTS:]
+    watch["last_run"] = int(now)
+    watch["last_error"] = (error or "")[:160]
+    return watch
+
+
+def _monitor_summary(watch: dict | None, now: float | None = None) -> dict:
+    """作品卡/接口用的监控摘要（不含全部采样点，点数走趋势接口）。"""
+    now = time.time() if now is None else now
+    if not isinstance(watch, dict) or not watch:
+        return {"enabled": False, "expired": False, "days": 0, "window_days": BENCH_MONITOR_DAYS,
+                "started_at": 0, "end_day": "", "last_ts": 0, "last_error": "", "last": None}
+    rows = _monitor_window_points(watch, now)
+    last = rows[-1] if rows else None
+    return {
+        "enabled": bool(watch.get("enabled")),
+        "expired": bool(watch.get("expired")) or _monitor_expired(watch, now),
+        "days": len(rows),
+        "window_days": BENCH_MONITOR_DAYS,
+        "started_at": int(watch.get("started_at") or 0),
+        "end_day": _monitor_window(watch, now)[1],
+        "last_ts": int(watch.get("last_run") or 0),
+        "last_error": watch.get("last_error") or "",
+        "last": ({"day": last.get("day"), "ts": last.get("ts"), "likes": last.get("likes"),
+                  "favorites": last.get("favorites"), "comments": last.get("comments"),
+                  "plays": last.get("plays"),
+                  "ok": bool(last.get("ok")), "error": last.get("error") or ""} if last else None),
+    }
+
+
+# ---- 采样状态（前端轮询）----
+def _monitor_write_status(state: str, message: str = "", *, done: int = 0, total: int = 0) -> None:
+    _bench_write_json(_monitor_run_file(), {"state": state, "message": message, "done": done,
+                                            "total": total, "ts": int(time.time())})
+
+
+def _monitor_read_status() -> dict:
+    fp = _monitor_run_file()
+    if not fp.is_file():
+        return {"state": "idle", "message": "", "done": 0, "total": 0, "ts": 0}
+    try:
+        data = json.loads(fp.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return {"state": "idle", "message": "", "done": 0, "total": 0, "ts": 0}
+    return {"state": str(data.get("state") or "idle"), "message": str(data.get("message") or ""),
+            "done": int(data.get("done") or 0), "total": int(data.get("total") or 0),
+            "ts": int(data.get("ts") or 0)}
+
+
+def _monitor_running() -> bool:
+    return bool(BENCH_MONITOR_TASK and not BENCH_MONITOR_TASK.done())
+
+
+def _bench_risk_hit(code: int, payload: dict, err: str = "") -> bool:
+    """统一的风控判定（与深挖/刷新同一套信号，不另起一套黑名单）。"""
+    if code == 2 or payload.get("risk"):
+        return True
+    return bool(_BENCH_RISK_RE.search(err or str(payload.get("error") or "")))
+
+
+# ---- 单条作品的取数 ----
+def _monitor_probe_detail(acc: dict, wid: str) -> dict:
+    """逐条读详情（小红书：1 条 = 1 个 HTTP 请求，纯 HTTP，不用浏览器）。
+
+    返回 ``{likes, favorites, comments, plays}`` 或 ``{error}``（风控时带 ``risk``）。
+    读不到就如实报错——**不拿作品列表里的旧数字冒充今天的采样**。
+    """
+    platform = acc.get("platform") or ""
+    works = _bench_read_works(acc.get("id", "")).get("works") or []
+    work = next((w for w in works if w.get("id") and str(w.get("id")) == str(wid)), None) or {}
+    token = (work.get("extra") or {}).get("xsec_token") or ""
+    if not token:
+        return {"error": "缺少定位信息（平台未返回 xsec_token），无法打开这条作品的详情页"}
+    code, res = _bench_script(
+        ["detail", "--platform", platform, "--target", acc.get("account_id", ""),
+         "--work-id", str(wid), "--xsec-token", token, "-q"]
+        + (["--cookie-file", cf] if (cf := _bench_cookie_file(platform)) else []),
+        BENCH_FETCH_TIMEOUT)
+    err = str(res.get("error") or "")
+    if code != 0 or err:
+        return {"error": (err or "读取失败")[:160], "risk": _bench_risk_hit(code, res, err)}
+    got = {key: res.get(key) for key in ("likes", "favorites", "comments", "plays")}
+    if all(v is None for v in got.values()):
+        return {"error": ((res.get("extra") or {}).get("detail_note")
+                          or "没读到互动数据（笔记可能已删除或页面改版）")[:160]}
+    return got
+
+
+def _monitor_snapshot_list(acc: dict) -> dict:
+    """列表型平台（抖音/TikTok）：作品指标随主页列表一起返回，刷**一次**账号即可。
+
+    这类平台没有单条详情接口，逐条打反而是多余请求；也正因为代价是「整号一次全量」，
+    监控时把冷却时间打上，避免用户紧接着手动刷新再打一次。
+    """
+    bid = str(acc.get("id") or "")
+    try:
+        updated = _bench_fetch_one(bid)
+    except Exception as e:  # noqa: BLE001 - 单账号失败不拖垮整轮
+        return {"error": f"刷新失败：{type(e).__name__}: {e}"[:160]}
+    if updated.get("status") == "risk":
+        return {"error": (updated.get("last_error") or "命中平台风控")[:160], "risk": True}
+    if updated.get("status") != "ok":
+        return {"error": (updated.get("last_error") or "刷新失败")[:160]}
+    BENCH_LAST_START[bid] = time.time()
+    rows = _bench_read_works(bid).get("works") or []
+    return {"works": {str(w.get("id")): w for w in rows if w.get("id")}}
+
+
+# ---- 一轮采样 ----
+def _monitor_targets(*, force: bool, only_bid: str | None = None,
+                     only_wids: list[str] | None = None,
+                     now: float | None = None) -> list[tuple[str, dict, str]]:
+    """找出这一轮要采样的 (账号 id, 账号记录, 作品 id)。"""
+    now = time.time() if now is None else now
+    accounts = _bench_read_accounts()
+    by_id = {str(a.get("id")): a for a in accounts}
+    bids = [only_bid] if only_bid else list(by_id.keys())
+    want = {str(w) for w in (only_wids or [])} or None
+    out: list[tuple[str, dict, str]] = []
+    for bid in bids:
+        if not bid or not re.fullmatch(r"[A-Za-z0-9_-]{4,32}", bid):
+            continue
+        acc = by_id.get(bid)
+        if not acc:
+            continue
+        data = _monitor_read(bid)
+        changed = _monitor_sweep(data, now)
+        for wid, watch in (data.get("works") or {}).items():
+            if not isinstance(watch, dict):
+                continue
+            if want is not None and str(wid) not in want:
+                continue
+            if not watch.get("enabled") or _monitor_expired(watch, now):
+                continue
+            if not force and not _monitor_due(watch, now):
+                continue
+            out.append((bid, acc, str(wid)))
+        if changed:
+            _monitor_write(bid, data)
+    return out
+
+
+async def _bench_monitor_run(*, force: bool = False, bid: str | None = None,
+                             wids: list[str] | None = None) -> None:
+    """采一轮：把到期（或 force 指定）的作品各记一个点。
+
+    - 小红书：逐条详情（1 条 = 1 个 HTTP 请求），条间用与深挖相同的对数正态间隔；
+    - 抖音/TikTok：一个账号刷一次主页，指标从列表里取（同一轮里不会重复刷）。
+    命中风控立刻停手，已完成的部分保留。
+    """
+    now = time.time()
+    targets = _monitor_targets(force=force, only_bid=bid, only_wids=wids, now=now)
+    total = len(targets)
+    if not targets:
+        _monitor_write_status(
+            "idle", "没有需要采样的作品（未到固定时间、今天已采过，或没有开启监控）")
+        return
+    _monitor_write_status("running", f"开始采样 {total} 条作品…", done=0, total=total)
+    done = 0
+    risk = ""
+    try:
+        snapshots: dict[str, dict] = {}      # 列表型平台：本轮已刷新的账号快照
+        for bid_i, acc, wid in targets:
+            data = _monitor_read(bid_i)
+            watch = (data.get("works") or {}).get(wid)
+            if not isinstance(watch, dict) or not watch.get("enabled") or _monitor_expired(watch):
+                continue                      # 跑到一半被关掉/到期的，直接跳过
+            platform = acc.get("platform") or ""
+            fields = (_bench_platform_meta(platform) or {}).get("fields") or {}
+            detail_manual = bool(fields.get("work_detail_manual"))
+            if detail_manual:
+                probe = await asyncio.to_thread(_monitor_probe_detail, acc, wid)
+            else:
+                if bid_i not in snapshots:
+                    snapshots[bid_i] = await asyncio.to_thread(_monitor_snapshot_list, acc)
+                snap = snapshots[bid_i]
+                if snap.get("error"):
+                    probe = {"error": snap["error"], "risk": bool(snap.get("risk"))}
+                else:
+                    src = (snap.get("works") or {}).get(wid) or {}
+                    probe = {key: src.get(key)
+                             for key in ("likes", "favorites", "comments", "plays")}
+                    if all(v is None for v in probe.values()):
+                        probe["error"] = "这次刷新里没有这条作品的数据（可能已删除）"
+            if probe.get("risk"):
+                risk = str(probe.get("error") or "命中平台风控")[:140]
+                # 记在作品上（不记点）：卡片/弹窗之后还能看出这条为什么没采到
+                watch["last_error"] = f"采样被平台风控拦住：{risk}"[:160]
+                _monitor_write(bid_i, data)
+                break
+            _monitor_record(watch, likes=probe.get("likes"), favorites=probe.get("favorites"),
+                            comments=probe.get("comments"), plays=probe.get("plays"),
+                            error=str(probe.get("error") or ""))
+            _monitor_write(bid_i, data)       # 逐条落盘：中途中断也不丢已采到的点
+            done += 1
+            _monitor_write_status("running", f"正在采样 {done}/{total}…", done=done, total=total)
+            if done < total:                  # 最后一条不必再等间隔
+                # 逐条详情要间隔；整号刷新本身已经慢，没必要再等
+                await asyncio.sleep(_bench_detail_gap() if detail_manual else 0.5)
+        if risk:
+            _monitor_write_status("risk", f"采样被平台风控拦住（已完成 {done}/{total} 条）：{risk}",
+                                  done=done, total=total)
+        else:
+            _monitor_write_status("done", f"采样完成：{done}/{total} 条作品", done=done, total=total)
+    except asyncio.CancelledError:
+        _monitor_write_status("cancelled", f"采样已停止（已完成 {done}/{total} 条）",
+                              done=done, total=total)
+        raise
+    except Exception as e:  # noqa: BLE001
+        _monitor_write_status("error", f"采样中断：{type(e).__name__}: {e}"[:180],
+                              done=done, total=total)
+
+
+def _monitor_spawn(**kwargs) -> asyncio.Task:
+    """启动一轮采样（同一时刻只允许一轮：平台的读操作本来就不能并发）。"""
+    global BENCH_MONITOR_TASK
+    task = asyncio.create_task(_bench_monitor_run(**kwargs))
+    BENCH_MONITOR_TASK = task
+
+    def _clear(t: asyncio.Task) -> None:
+        global BENCH_MONITOR_TASK
+        if BENCH_MONITOR_TASK is t:
+            BENCH_MONITOR_TASK = None
+
+    task.add_done_callback(_clear)
+    return task
+
+
+# ---- 每日调度 ----
+async def _bench_monitor_loop() -> None:
+    """每天到点采一次；进程当时没在跑就等启动后补采（当天只补一次）。
+
+    本地 Web 服务不会 24 小时开着，所以「固定时间」必须配一个**补采**语义：
+    否则用户第二天上午才打开 Easel，昨天的点就永远缺了。
+    """
+    await asyncio.sleep(BENCH_MONITOR_STARTUP_DELAY)   # 先让 web 服务起来，别和启动期抢资源
+    while True:
+        try:
+            if not _monitor_running() and _monitor_targets(force=False):
+                _monitor_spawn(force=False)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 - 调度异常每轮只记状态，不中断循环
+            _monitor_write_status("error", f"监控调度异常：{type(e).__name__}: {e}"[:180])
+        await asyncio.sleep(BENCH_MONITOR_TICK)
+
+
+def _bench_monitor_loop_start() -> None:
+    """在应用启动时挂上调度循环（EASEL_BENCH_MONITOR=0 可关掉，测试与 CI 用）。"""
+    global BENCH_MONITOR_LOOP_TASK
+    if os.environ.get("EASEL_BENCH_MONITOR", "").strip().lower() in ("0", "off", "false", "no"):
+        return
+    if BENCH_MONITOR_LOOP_TASK and not BENCH_MONITOR_LOOP_TASK.done():
+        return
+    BENCH_MONITOR_LOOP_TASK = asyncio.create_task(_bench_monitor_loop())
+
+
+async def _bench_monitor_loop_stop() -> None:
+    global BENCH_MONITOR_LOOP_TASK
+    task, BENCH_MONITOR_LOOP_TASK = BENCH_MONITOR_LOOP_TASK, None
+    if task and not task.done():
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+# ---- 接口 ----
+class BenchMonitorToggle(BaseModel):
+    enabled: bool = True
+
+
+class BenchMonitorSchedule(BaseModel):
+    hour: int = BENCH_MONITOR_DEFAULT_HOUR
+    minute: int = BENCH_MONITOR_DEFAULT_MINUTE
+
+
+def _monitor_counts(now: float | None = None) -> dict:
+    now = time.time() if now is None else now
+    monitored = expired = accounts = 0
+    for acc in _bench_read_accounts():
+        bid = str(acc.get("id") or "")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{4,32}", bid):
+            continue
+        data = _monitor_read(bid)
+        if _monitor_sweep(data, now):
+            _monitor_write(bid, data)
+        items = [w for w in (data.get("works") or {}).values() if isinstance(w, dict)]
+        if items:
+            accounts += 1
+        monitored += sum(1 for w in items if w.get("enabled"))
+        expired += sum(1 for w in items if w.get("expired") and not w.get("enabled"))
+    return {"monitored": monitored, "expired": expired, "monitor_accounts": accounts}
+
+
+@app.get("/api/benchmarks/monitor/schedule")
+async def api_bench_monitor_schedule():
+    """监控的全局设置：每天几点采样 + 下一次采样时间 + 当前监控数。"""
+    now = time.time()
+    return {**_monitor_read_schedule(), "next_run_ts": _monitor_next_run_ts(now),
+            "last_run": _monitor_read_status(), "running": _monitor_running(),
+            **_monitor_counts(now)}
+
+
+@app.put("/api/benchmarks/monitor/schedule")
+async def api_bench_monitor_set_schedule(req: BenchMonitorSchedule):
+    """改「每天固定几点采样」。只影响后续轮次，不影响已记下的点。"""
+    if not 0 <= int(req.hour) <= 23:
+        raise HTTPException(400, "小时要在 0-23 之间")
+    if not 0 <= int(req.minute) <= 59:
+        raise HTTPException(400, "分钟要在 0-59 之间")
+    _monitor_write_schedule(req.hour, req.minute)
+    return {**_monitor_read_schedule(), "next_run_ts": _monitor_next_run_ts()}
+
+
+@app.get("/api/benchmarks/monitor/status")
+async def api_bench_monitor_status():
+    """采样进度（前端在采样期间轮询它）。"""
+    return {**_monitor_read_status(), "running": _monitor_running(),
+            "next_run_ts": _monitor_next_run_ts(), "schedule": _monitor_read_schedule()}
+
+
+@app.post("/api/benchmarks/monitor/run")
+async def api_bench_monitor_run(force: bool = True, bid: str | None = None):
+    """立刻采一轮（force=true 覆盖当天已有的点）。
+
+    手动触发也走同一条串行链路，不并发；正有一轮在跑时直接复用。
+    """
+    if _monitor_running():
+        return {"state": "running", "message": "已有一轮采样在进行中", "reused": True}
+    targets = _monitor_targets(force=bool(force), only_bid=bid)
+    if not targets:
+        return {"state": "idle", "total": 0,
+                "message": "没有需要采样的作品（没有开启监控，或没到今天的固定时间）"}
+    _monitor_spawn(force=bool(force), bid=bid)
+    return {"state": "running", "total": len(targets),
+            "message": f"开始采样 {len(targets)} 条作品"}
+
+
+@app.post("/api/benchmarks/{bid}/works/{wid}/monitor")
+async def api_bench_work_monitor(bid: str, wid: str, req: BenchMonitorToggle):
+    """给单篇作品开/关监控。
+
+    开启时**立刻采第一个点**（作为趋势起点），否则用户要等到明天才看得到数据。
+    这一步是同步的（小红书约 0.5-1 秒，纯 HTTP 详情页），与「单条深挖」接口同量级；
+    列表型平台（抖音/TikTok）要刷整号主页，代价太大，交给每日调度，这里只登记。
+    """
+    accounts = _bench_read_accounts()
+    acc = next((a for a in accounts if a.get("id") == bid), None)
+    if acc is None:
+        raise HTTPException(404, "对标账号不存在")
+    if not (wid or "").strip():
+        raise HTTPException(400, "缺少作品 ID：该平台没有返回作品 ID（游客态），无法定位这条作品")
+    payload = _bench_read_works(bid)
+    works = payload.get("works") or []
+    work = next((w for w in works if w.get("id") and str(w.get("id")) == str(wid)), None)
+    if work is None:
+        raise HTTPException(404, "作品不存在（平台没返回作品 ID 时无法定位，也就无法监控）")
+    meta = _bench_platform_meta(acc.get("platform", ""))
+    if req.enabled and not meta.get("auto"):
+        raise HTTPException(400, f"{meta.get('name') or acc.get('platform')}暂不支持自动取数，"
+                                 "无法监控作品表现")
+
+    now = time.time()
+    data = _monitor_read(bid)
+    _monitor_sweep(data, now)
+    watch = data["works"].get(str(wid))
+    if not isinstance(watch, dict):
+        watch = {"enabled": False, "expired": False, "started_at": 0, "points": [],
+                 "last_run": 0, "last_error": ""}
+    sampled = False
+    message = ""
+    if req.enabled:
+        restart = not watch.get("enabled") or watch.get("expired") or not watch.get("started_at")
+        if restart:
+            # 新开一轮 15 天：窗口从今天算起。旧点留着（会自然落到窗口外，不干扰趋势）
+            watch.update({"started_at": int(now), "expired": False, "stopped_at": 0})
+        watch["enabled"] = True
+        data["works"][str(wid)] = watch
+        _monitor_write(bid, data)
+        fields = meta.get("fields") or {}
+        if fields.get("work_detail_manual"):
+            if _monitor_running():
+                message = "已开启监控；已有一轮采样在进行，这个点会在下一轮补上"
+            else:
+                probe = await asyncio.to_thread(_monitor_probe_detail, acc, str(wid))
+                _monitor_record(watch, likes=probe.get("likes"), favorites=probe.get("favorites"),
+                                comments=probe.get("comments"), plays=probe.get("plays"),
+                                error=str(probe.get("error") or ""), now=now)
+                _monitor_write(bid, data)
+                sampled = not probe.get("error")
+                if probe.get("risk"):
+                    message = f"已开启监控，但本次采样被平台风控拦住：{probe.get('error')}"
+                elif probe.get("error"):
+                    message = f"已开启监控，但本次采样没读到数据：{probe.get('error')}"
+                else:
+                    message = "已开启监控，并记下今天的第一个点"
+        else:
+            message = "已开启监控：该平台的作品指标随整号刷新返回，会在每天固定时间整号刷新时记录"
+    else:
+        watch["enabled"] = False
+        watch["stopped_at"] = int(now)
+        data["works"][str(wid)] = watch
+        _monitor_write(bid, data)
+        message = f"已停止监控，已记录的 {_monitor_summary(watch, now)['days']} 个点保留"
+
+    if _monitor_sweep(data, now):
+        _monitor_write(bid, data)
+    return {"monitor": _monitor_summary(watch, now), "sampled": sampled, "message": message,
+            "next_run_ts": _monitor_next_run_ts(now)}
+
+
+@app.get("/api/benchmarks/{bid}/works/{wid}/trend")
+async def api_bench_work_trend(bid: str, wid: str, days: int = BENCH_MONITOR_DAYS):
+    """某条作品的点赞/收藏/评论（+ 平台公开的播放量）趋势。
+
+    返回按自然日对齐的序列：**没采到的那天是 null**（不是 0、不是前一天的重复），
+    前端因此能画出真实的缺口，而不是一条骗人的平滑曲线。
+
+    x 轴从**第一个有记录的日子**开始画（而不是固定贴着今天往回数满 N 天），
+    这样刚开始监控时第一个点就在最左侧，不会孤零零挂在右边。
+    ``days`` 只是「最多显示几天」的上限。
+    """
+    accounts = _bench_read_accounts()
+    acc = next((a for a in accounts if a.get("id") == bid), None)
+    if acc is None:
+        raise HTTPException(404, "对标账号不存在")
+    works = _bench_read_works(bid).get("works") or []
+    work = next((w for w in works if w.get("id") and str(w.get("id")) == str(wid)), None)
+    if work is None:
+        raise HTTPException(404, "作品不存在")
+    days = max(1, min(int(days or BENCH_MONITOR_DAYS), BENCH_MONITOR_DAYS))
+    now = time.time()
+    data = _monitor_read(bid)
+    if _monitor_sweep(data, now):
+        _monitor_write(bid, data)
+    watch = data["works"].get(str(wid))
+    meta = _bench_platform_meta(acc.get("platform", ""))
+    fields = meta.get("fields") or {}
+    today = _monitor_day(now)
+
+    # x 轴从「第一个有记录的日子」开始，而不是固定贴着今天往回数满 15 天：
+    # 刚开始监控时右边孤零零一个点、左边十几天空白，看起来像坏了（用户实测反馈）。
+    window_start, window_end = _monitor_window(watch or {}, now)
+    points = [p for p in ((watch or {}).get("points") or [])
+              if isinstance(p, dict) and window_start <= str(p.get("day") or "") <= window_end]
+    points.sort(key=lambda p: str(p.get("day") or ""))
+    point_days = [str(p.get("day")) for p in points]
+
+    # 还在监控中 → 右端画到今天（「今天」这个刻度才成立）；已停止/已到期 → 画到最后一个点，
+    # 免得停了一周之后图上右边挂一排空刻度。
+    active = bool((watch or {}).get("enabled")) and not _monitor_expired(watch or {}, now)
+    axis_end = today if active else (point_days[-1] if point_days else today)
+    axis_start = point_days[0] if point_days else axis_end
+    if _monitor_day_ts(axis_start) > _monitor_day_ts(axis_end):
+        axis_start = axis_end
+    # days 参数现在只是「最多显示几天」的上限（15 天窗口本身不会更长）
+    floor_ts = _monitor_day_ts(axis_end) - (days - 1) * 86400
+    if _monitor_day_ts(axis_start) < floor_ts:
+        axis_start = _monitor_day(floor_ts)
+
+    day_list: list[str] = []
+    ts = _monitor_day_ts(axis_start)
+    for _ in range(days + 2):          # 多给两步容错：夏令时那类日长变化不会漏掉末尾那天
+        day = _monitor_day(ts)
+        if day > axis_end:
+            break
+        if not day_list or day_list[-1] != day:
+            day_list.append(day)
+        ts += 86400
+
+    rows = [p for p in points if axis_start <= str(p.get("day") or "") <= axis_end]
+    by_day = {str(p.get("day")): p for p in rows}
+
+    def series(key: str, label: str, available: bool) -> dict:
+        out = []
+        for day in day_list:
+            point = by_day.get(day) or {}
+            out.append({"day": day, "value": point.get(key), "sampled": bool(point),
+                        "ok": bool(point.get("ok")) if point else False})
+        values = [(r["day"], r["value"]) for r in out if r["value"] is not None]
+        stats = {"first": None, "last": None, "delta": None, "pct": None, "count": len(values),
+                 "first_day": "", "last_day": ""}
+        if values:
+            first_day, first = values[0]
+            last_day, last = values[-1]
+            delta = last - first
+            stats.update({"first": first, "last": last, "delta": delta,
+                          "pct": (round(delta / first * 100, 1) if first else None),
+                          "first_day": first_day, "last_day": last_day})
+        return {"key": key, "label": label, "available": available, "rows": out, "stats": stats}
+
+    def build_series() -> list[dict]:
+        """三条基础序列 + 平台公开播放量时再加一条。
+
+        小红书没有播放量、抖音的 ``play_count`` 恒为 0（不是公开数据，见
+        benchmark_fetch._public_plays），所以只有 TikTok 这类声明了
+        ``work_plays`` 的平台才多出这条「播放量」（即平台的阅读/观看次数）。
+        """
+        out = [series("likes", "点赞", bool(fields.get("work_likes"))),
+               series("favorites", "收藏", bool(fields.get("work_favorites"))),
+               series("comments", "评论", bool(fields.get("work_comments")))]
+        if fields.get("work_plays"):
+            out.append(series("plays", "播放量", True))
+        return out
+
+    return {
+        "work": {"id": str(wid), "title": work.get("title") or "", "url": work.get("url") or "",
+                 "cover_path": work.get("cover_path") or "",
+                 "published_at_ms": work.get("published_at_ms"),
+                 "current": {"likes": work.get("likes"), "favorites": work.get("favorites"),
+                             "comments": work.get("comments"), "plays": work.get("plays")}},
+        "account": {"id": bid, "nickname": acc.get("nickname") or "",
+                    "platform": acc.get("platform") or "",
+                    "platform_name": acc.get("platform_name") or ""},
+        "available": {"likes": bool(fields.get("work_likes")),
+                      "favorites": bool(fields.get("work_favorites")),
+                      "comments": bool(fields.get("work_comments")),
+                      "plays": bool(fields.get("work_plays"))},
+        "monitor": _monitor_summary(watch, now),
+        "days": days,
+        "window_days": BENCH_MONITOR_DAYS,
+        # 今天 / 实际画出来的区间：前端靠 today 决定右端要不要标「（今天）」，
+        # 靠 axis 可以核对「第一个点是否真的贴在最左侧」。
+        "today": today,
+        "axis": {"start_day": day_list[0] if day_list else today,
+                 "end_day": day_list[-1] if day_list else today,
+                 "slots": len(day_list)},
+        "points": rows,
+        "series": build_series(),
+        "schedule": _monitor_read_schedule(),
+        "next_run_ts": _monitor_next_run_ts(now),
+        "run": {**_monitor_read_status(), "running": _monitor_running()},
+    }
 
 
 if __name__ == "__main__":

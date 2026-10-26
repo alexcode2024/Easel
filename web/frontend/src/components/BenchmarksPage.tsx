@@ -4,11 +4,16 @@ import {
   fetchBenchmarkNow, fetchBenchmarkWorkDetail, fetchBenchmarkWorksDetailBatch,
   fetchAllBenchmarks, benchmarkFetchAllStatus,
   fetchBenchCookies, downloadBenchWork,
+  fetchMonitorSchedule, fetchMonitorStatus, runMonitorNow, toggleWorkMonitor,
   mediaUrl, createIdea,
 } from '../lib/api';
-import type { BenchAccount, BenchDetail, BenchPlatform, BenchWork, BenchCookieStatus } from '../lib/api';
+import type {
+  BenchAccount, BenchDetail, BenchPlatform, BenchWork, BenchCookieStatus, BenchMonitorSchedule,
+} from '../lib/api';
 import CookieModal from './CookieModal';
-import { IconAccounts, IconTrash, IconChevron, IconIdea, IconChat } from './icons';
+import WorkTrendModal from './WorkTrendModal';
+import { fmtDateTime, fmtWhen, pad2 } from '../lib/trendFormat';
+import { IconAccounts, IconTrash, IconChevron, IconChat } from './icons';
 
 /** 对标账号：管理「别人的」公开账号，看他们最近在发什么、哪些是爆款。
  *
@@ -66,6 +71,12 @@ export default function BenchmarksPage({ onAskAgent, onBreakdown }: BenchmarksPa
   const [syncBudget, setSyncBudget] = useState(10);   // 刷新时最多补下几条新作品的素材
   const [cookies, setCookies] = useState<BenchCookieStatus[]>([]);
   const [cookieForm, setCookieForm] = useState<{ platform: string; value: string } | null>(null);
+  // 表现监控：设置（每天几点采样）+ 正在跑的那一轮进度；趋势弹窗针对单篇作品
+  const [monitorInfo, setMonitorInfo] = useState<BenchMonitorSchedule | null>(null);
+  const [sampling, setSampling] = useState<{ running: boolean; done: number; total: number } | null>(null);
+  const [trendWork, setTrendWork] = useState<BenchWork | null>(null);
+  // 作品行的「⋯」菜单：一次只开一个，点空白处/按 Esc 关闭
+  const [openMenu, setOpenMenu] = useState<string | null>(null);
   const pollRef = useRef<number | null>(null);
   // 冷却倒计时：后端只在响应里给「还剩多少秒」，不会自己走；这里记下列表拉取时刻本地递减，
   // 否则抓完一次后行内刷新按钮会一直灰着直到刷新页面。
@@ -88,6 +99,53 @@ export default function BenchmarksPage({ onAskAgent, onBreakdown }: BenchmarksPa
   const loadDetail = useCallback((id: string) => {
     fetchBenchmark(id).then(setDetail).catch((e) => setErr(String(e.message || e)));
   }, []);
+
+  // 监控设置（全局：每天几点采样）——页头的「监控 N 篇 · 每天 09:00」用它渲染
+  const loadMonitorInfo = useCallback(() => {
+    fetchMonitorSchedule()
+      .then((info) => {
+        setMonitorInfo(info);
+        if (info.running) {
+          setSampling((prev) => (prev?.running ? prev : {
+            running: true, done: info.last_run.done, total: info.last_run.total,
+          }));
+        }
+      })
+      .catch(() => { /* 设置读不到不影响主流程 */ });
+  }, []);
+
+  useEffect(() => { loadMonitorInfo(); }, [loadMonitorInfo]);
+
+  // 作品行的 「⋯」菜单：Esc 关闭（点空白由遮罩负责）
+  useEffect(() => {
+    if (!openMenu) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpenMenu(null); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [openMenu]);
+
+  // 监控状态变了 → 作品卡（开关/天数）与页头汇总一起刷
+  const refreshMonitorViews = useCallback(() => {
+    if (selected) loadDetail(selected);
+    loadMonitorInfo();
+  }, [selected, loadDetail, loadMonitorInfo]);
+
+  // 采样在跑时轮询：一轮几十秒到几分钟（逐条详情），结束后把作品列表刷新一遍
+  useEffect(() => {
+    if (!sampling?.running) return;
+    const tick = window.setInterval(async () => {
+      try {
+        const st = await fetchMonitorStatus();
+        if (st.running) {
+          setSampling({ running: true, done: st.done, total: st.total });
+          return;
+        }
+        setSampling({ running: false, done: st.done, total: st.total });
+        refreshMonitorViews();
+      } catch { /* 轮询失败忽略，下轮再试 */ }
+    }, 3000);
+    return () => window.clearInterval(tick);
+  }, [sampling?.running, refreshMonitorViews]);
 
   useEffect(() => {
     fetchBenchPlatforms().then((r) => setPlatforms(r.platforms)).catch(() => {});
@@ -247,6 +305,50 @@ export default function BenchmarksPage({ onAskAgent, onBreakdown }: BenchmarksPa
   const autoPlatforms = platforms.filter((p) => p.auto);
   const manualPlatforms = platforms.filter((p) => !p.auto);
 
+  // 单篇作品开/关监控：开启时后端会顺手记下今天的第一个点（列表型平台除外）
+  const toggleMonitor = async (w: BenchWork) => {
+    if (!selected || !w.id) return;
+    const on = !!w.monitor?.enabled;
+    setErr('');
+    setBusyWork(w.id);
+    try {
+      const r = await toggleWorkMonitor(selected, w.id, !on);
+      showToast(r.message || (on ? '已停止监控' : '已开启监控'));
+      refreshMonitorViews();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : '操作失败');
+    } finally {
+      setTimeout(() => setBusyWork(''), 600);
+    }
+  };
+
+  const sampleAllNow = async () => {
+    if (!selected) return;
+    setErr('');
+    try {
+      const r = await runMonitorNow(selected);
+      if (r.state === 'running') {
+        setSampling({ running: true, done: 0, total: r.total || 0 });
+        showToast(r.message || '开始采样');
+      } else {
+        showToast(r.message || '没有需要采样的作品');
+      }
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : '触发采样失败');
+    }
+  };
+
+  // 该账号下监控的概况（作品卡上的开关状态总和）
+  const monStats = useMemo(() => {
+    let enabled = 0;
+    let expired = 0;
+    for (const w of detail?.works ?? []) {
+      if (w.monitor?.enabled) enabled += 1;
+      else if (w.monitor?.expired) expired += 1;
+    }
+    return { enabled, expired };
+  }, [detail]);
+
   return (
     <div className="page-scroll bench-page">
       <div className="page-head">
@@ -383,6 +485,11 @@ export default function BenchmarksPage({ onAskAgent, onBreakdown }: BenchmarksPa
                           {st === 'error' && <div className="bench-tag danger" title={a.last_error}>失败</div>}
                           {a.status === 'manual' && <div className="bench-tag">手动登记</div>}
                           {a.logged_in === false && <div className="bench-tag warn" title="登录态未生效，部分字段平台只给占位值">登录态失效</div>}
+                          {(a.monitor?.monitored ?? 0) > 0 && (
+                            <div className="bench-tag ok" title="这个账号下有作品在监控中，每天自动记录表现">
+                              📈 监控 {a.monitor?.monitored}
+                            </div>
+                          )}
                         </td>
                         <td className="bench-actions" onClick={(e) => e.stopPropagation()}>
                           {meta?.auto && (() => {
@@ -527,6 +634,30 @@ export default function BenchmarksPage({ onAskAgent, onBreakdown }: BenchmarksPa
             )}
           </div>
 
+          {/* 表现监控概况：开了监控才出现，避免没开的时候白占一行 */}
+          {(monStats.enabled > 0 || monStats.expired > 0 || sampling) && (
+            <div className="bench-monitor-bar">
+              <span className="bench-monitor-title">📈 表现监控</span>
+              <span className="bench-monitor-meta">
+                {monStats.enabled > 0 ? `监控中 ${monStats.enabled} 篇` : '暂无监控中的作品'}
+                {monStats.expired > 0 ? ` · 已到期 ${monStats.expired} 篇` : ''}
+                {monitorInfo ? ` · 每天 ${pad2(monitorInfo.hour)}:${pad2(monitorInfo.minute)} 采样` : ''}
+                {monStats.enabled > 0 && monitorInfo?.next_run_ts
+                  ? ` · 下次 ${fmtWhen(monitorInfo.next_run_ts)}` : ''}
+              </span>
+              {sampling?.running && (
+                <span className="bench-monitor-run">
+                  采样中 {sampling.done}/{sampling.total || '…'}
+                </span>
+              )}
+              <button className="bench-act" onClick={sampleAllNow}
+                disabled={!!sampling?.running || monStats.enabled === 0}
+                title="马上把本账号监控中的作品各采一次（会覆盖今天的采样点）">
+                ⟳ 立即采样
+              </button>
+            </div>
+          )}
+
           {detail.works.length === 0 && (
             <div className="card bench-empty">
               {detail.account.running || detail.fetch?.state === 'running'
@@ -535,69 +666,148 @@ export default function BenchmarksPage({ onAskAgent, onBreakdown }: BenchmarksPa
             </div>
           )}
 
-          <div className="bench-grid">
-            {(showAllWorks ? detail.works : detail.works.slice(0, 10)).map((w, i) => {
+          <div className="wl-list">
+            <div className="wl-head">
+              <div className="wl-work">作品</div>
+              <div className="wl-num">阅读量</div>
+              <div className="wl-num">点赞</div>
+              <div className="wl-num">收藏</div>
+              <div className="wl-num">评论</div>
+              <div className="wl-mon-cell">监控</div>
+              <div className="wl-actions">操作</div>
+            </div>
+
+            {(showAllWorks ? detail.works : detail.works.slice(0, 10)).map((w, i, visible) => {
               const f = (detail.platform as BenchPlatform)?.fields || {};
+              const key = w.id || `${i}-${w.title}`;
+              const menuOpen = openMenu === key;
+              const cover = w.cover_path ? mediaUrl(w.cover_path) : w.cover_url;
+              // 更新时间 = 这条作品的表现数据最近一次采集时间（监控中的用采样时间，
+              // 其余用账号最近抓取时间）；不是笔记本身的编辑时间（那只有下载过的才有）
+              const updatedSec = w.monitor?.last_ts || detail.fetched_at || 0;
               return (
-                <article key={w.id || `${i}-${w.title}`} className={`card bench-work${w.is_burst ? ' burst' : ''}`}>
-                  <div className="bench-work-cover">
-                    {w.cover_path ? (
-                      <img src={mediaUrl(w.cover_path)} alt="" loading="lazy" referrerPolicy="no-referrer" />
-                    ) : w.cover_url ? (
-                      <img src={w.cover_url} alt="" loading="lazy" referrerPolicy="no-referrer" />
-                    ) : (
-                      <span className="bench-work-ph">📝</span>
-                    )}
-                    {w.is_burst && <span className="bench-burst">爆款</span>}
-                    {w.is_top && <span className="bench-top">置顶</span>}
-                  </div>
-                  <div className="bench-work-body">
-                    <div className="bench-work-title" title={w.title}>{w.title}</div>
-                    <div className="bench-work-time">{timeAgo(w.published_at_ms)}</div>
-                    <div className="bench-work-stats">
-                      {w.plays !== null && w.plays !== undefined && (
-                        <span title="播放量">▶ {fmtNum(w.plays)}</span>
+                <div key={key}
+                  className={`wl-row${w.is_burst ? ' burst' : ''}${w.id ? ' clickable' : ''}`
+                    + `${i === 0 ? ' first' : ''}`}
+                  onClick={() => { setOpenMenu(null); if (w.id) setTrendWork(w); }}>
+                  <div className="wl-work">
+                    <div className="wl-cover-wrap">
+                      {cover ? (
+                        <img className="wl-cover" src={cover} alt="" loading="lazy"
+                          referrerPolicy="no-referrer" />
+                      ) : (
+                        <div className="wl-cover ph">📝</div>
                       )}
-                      <span title="点赞">👍 {fmtNum(w.likes)}</span>
-                      <span title={f.work_favorites ? '收藏' : '该平台不公开收藏数'}>⭐ {fmtNum(w.favorites)}</span>
-                      <span title={f.work_comments ? '评论' : '该平台不公开评论数'}>💬 {fmtNum(w.comments)}</span>
                     </div>
-                    <div className="bench-work-actions">
-                      {w.url && <a className="bench-act" href={w.url} target="_blank" rel="noreferrer">原文 ↗</a>}
-                      {onBreakdown && (
-                        <button className="bench-act" onClick={() => onBreakdown(
-                          `${w.title}\n（来源：${detail.account.nickname || detail.account.account_id} · `
-                          + `${detail.account.platform_name} · 点赞 ${w.likes ?? '—'}）`)}>拆解</button>
+                    <div className="wl-info">
+                      <div className="wl-title" title={w.title}>
+                        <span className="wl-title-text">{w.title}</span>
+                        {w.is_burst && <span className="wl-tag burst">爆款</span>}
+                        {w.is_top && <span className="wl-tag top">置顶</span>}
+                      </div>
+                      <div className="wl-time">发布时间 {fmtDateTime(w.published_at_ms)}</div>
+                      <div className="wl-time">更新时间 {fmtDateTime(updatedSec * 1000)}</div>
+                      {/* 原文链接单独一行（在「更新时间」下面）；点它不要顺带打开趋势弹窗 */}
+                      {w.url && (
+                        <a className="wl-link" href={w.url} target="_blank" rel="noreferrer"
+                          title="在平台打开这条作品"
+                          onClick={(e) => e.stopPropagation()}>
+                          原文 ↗
+                        </a>
                       )}
-                      <button className="bench-act" onClick={() => toIdeas(w, detail.account)}>
-                        <IconIdea size={12} /> 存选题
+                    </div>
+                  </div>
+
+                  <div className={`wl-num${f.work_plays ? '' : ' wl-na'}`}
+                    title={f.work_plays ? '阅读量（平台的播放/观看次数）'
+                      : '该平台不公开阅读量，显示「—」，不估算'}>
+                    {f.work_plays ? fmtNum(w.plays) : '—'}
+                  </div>
+                  <div className="wl-num">{fmtNum(w.likes)}</div>
+                  <div className="wl-num">{fmtNum(w.favorites)}</div>
+                  <div className="wl-num">{fmtNum(w.comments)}</div>
+
+                  <div className="wl-mon-cell" onClick={(e) => e.stopPropagation()}>
+                    {w.id && (
+                      <button
+                        className={`bench-mon${w.monitor?.enabled ? ' on' : ''}`
+                          + `${w.monitor?.expired && !w.monitor?.enabled ? ' expired' : ''}`}
+                        disabled={busyWork === w.id}
+                        title={w.monitor?.enabled
+                          ? `监控中：已记录 ${w.monitor.days}/${w.monitor.window_days} 天，`
+                            + `每天 ${pad2(monitorInfo?.hour ?? 9)}:${pad2(monitorInfo?.minute ?? 0)} 自动采样；点一下停止`
+                          : w.monitor?.expired
+                            ? '这一轮已记满 15 天并自动停止；点一下重新开始'
+                            : '开启监控：每天固定时间记录点赞/收藏/评论，最多连续 15 天'}
+                        onClick={() => toggleMonitor(w)}>
+                        <i className="bench-mon-dot" />
+                        {w.monitor?.enabled
+                          ? `监控中 ${w.monitor.days}天`
+                          : w.monitor?.expired ? '已到期' : '监控'}
                       </button>
-                      {w.detail_available && !w.detail_fetched && (
-                        <button className="bench-act" onClick={() => deepDive(w)}>深挖</button>
-                      )}
-                      {/* 小红书：把这条笔记的全部数据下下来（图片原图/动图 + 视频，默认 1080p） */}
-                      {detail.account.platform === 'xiaohongshu' && w.id && (
-                        w.downloaded && w.download ? (
-                          <a className="bench-act" target="_blank" rel="noreferrer"
-                            href={mediaUrl(w.download.note_md)}
-                            title={`已下载 ${w.download.files} 个文件（${(w.download.bytes / 1048576).toFixed(1)}MB）`
-                              + ` · 打开笔记记录（含正文/标签/互动数据）`}>
-                            ✓ 已下载 {w.download.files}
-                          </a>
-                        ) : (
-                          <button className="bench-act" disabled={w.downloading || busyWork === w.id}
-                            title="下载这条笔记的全部数据：图片原图（含动图）+ 视频（默认最低画质，省磁盘）+ 元数据记录"
-                            onClick={() => downloadWork(w)}>
-                            {w.downloading || busyWork === w.id ? '下载中…' : '⬇ 下载'}
-                          </button>
-                        )
-                      )}
-                    </div>
+                    )}
                   </div>
-                </article>
+
+                  <div className="wl-actions" onClick={(e) => e.stopPropagation()}>
+                    {w.id && (
+                      <button className="wl-act"
+                        title={`查看监控期间${f.work_plays ? '点赞/收藏/评论/播放量' : '点赞/收藏/评论'}的变化趋势`
+                          + '（有点的日子才画，最多 15 天）'}
+                        onClick={() => { setOpenMenu(null); setTrendWork(w); }}>趋势</button>
+                    )}
+                    {detail.account.platform === 'xiaohongshu' && w.id && (
+                      w.downloaded && w.download ? (
+                        <a className="wl-dl" target="_blank" rel="noreferrer"
+                          href={mediaUrl(w.download.note_md)}
+                          title={`已下载 ${w.download.files} 个文件（${(w.download.bytes / 1048576).toFixed(1)}MB）`
+                            + ` · 打开笔记记录（含正文/标签/互动数据）`}>
+                          ✓ {w.download.files}
+                        </a>
+                      ) : (
+                        <button className="wl-act" disabled={w.downloading || busyWork === w.id}
+                          title="下载这条笔记的全部数据：图片原图（含动图）+ 视频（默认最低画质，省磁盘）+ 元数据记录"
+                          onClick={() => downloadWork(w)}>
+                          {w.downloading || busyWork === w.id ? '…' : '下载'}
+                        </button>
+                      )
+                    )}
+                    <button className={`wl-act${menuOpen ? ' on' : ''}`} title="更多操作"
+                      aria-haspopup="menu" aria-expanded={menuOpen}
+                      onClick={() => setOpenMenu(menuOpen ? null : key)}>⋯</button>
+
+                    {menuOpen && (
+                      // 最后两行朝上弹，否则菜单会被列表/视口下边缘截掉
+                      <div className={`wl-menu${i >= visible.length - 2 ? ' up' : ''}`} role="menu">
+                        {/* 「原文 ↗」已经挪到「更新时间」下面那一行，这里不重复 */}
+                        {onBreakdown && (
+                          <button className="wl-menu-item" onClick={() => {
+                            setOpenMenu(null);
+                            onBreakdown(
+                              `${w.title}\n（来源：${detail.account.nickname || detail.account.account_id} · `
+                              + `${detail.account.platform_name} · 点赞 ${w.likes ?? '—'}）`);
+                          }}>拆解</button>
+                        )}
+                        <button className="wl-menu-item" onClick={() => {
+                          setOpenMenu(null);
+                          toIdeas(w, detail.account);
+                        }}>存选题</button>
+                        {w.detail_available && !w.detail_fetched && (
+                          <button className="wl-menu-item" onClick={() => {
+                            setOpenMenu(null);
+                            deepDive(w);
+                          }}>深挖</button>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                </div>
               );
             })}
           </div>
+
+          {openMenu && (
+            <div className="wl-menu-backdrop" onClick={() => setOpenMenu(null)} />
+          )}
 
           {detail.works.length > 0 && !(detail.platform as BenchPlatform)?.fields?.work_favorites
             && !(detail.platform as BenchPlatform)?.fields?.work_comments && (
@@ -611,6 +821,16 @@ export default function BenchmarksPage({ onAskAgent, onBreakdown }: BenchmarksPa
 
       {selected && !detail && (
         <div className="loading" style={{ padding: 40 }}><div className="spinner" />加载中…</div>
+      )}
+
+      {trendWork && selected && (
+        <WorkTrendModal
+          bid={selected}
+          workId={trendWork.id}
+          workTitle={trendWork.title}
+          onClose={() => setTrendWork(null)}
+          onChanged={refreshMonitorViews}
+        />
       )}
 
       {cookieForm && (

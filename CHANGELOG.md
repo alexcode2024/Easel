@@ -2,6 +2,25 @@
 
 All notable changes to Easel are documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- Added per-note performance monitoring to benchmark accounts: each work card has a monitoring switch that samples likes/favorites/comments once a day at a fixed time (default 09:00, editable) for up to 15 consecutive days, plus a 「📈 趋势」 button that opens line charts (likes / favorites / comments) for the last 15 days; platforms that publish view counts (TikTok) get an extra 播放量 line. Days that were not sampled stay as gaps instead of being interpolated, a failed re-sample never overwrites a good reading, and the monitor stops automatically when the 15-day window ends. See [docs/benchmarks.md](docs/benchmarks.md#5-作品表现监控15-天趋势).
+
+### Fixed
+
+- Fixed the per-work trend chart rendering only isolated dots whenever the monitored days were not consecutive: the chart used to break the line at every unsampled day, so two samples separated by a missed day produced no line at all. Observed values are now connected in date order — a segment that spans unsampled days is drawn dashed (its tooltip names both dates) so the trend is readable without inventing data points.
+- Fixed `scripts/gateway.ps1 start` reporting failure on a healthy launch: it gave up after 20 seconds while an OpenClaw cold start takes 60–90 seconds here (plugin loading plus a state-schema preflight), so the gateway came up but the command exited 1 with「启动失败」. It now polls for up to 180 seconds, matching `gateway.sh`.
+- Fixed `easel.ps1` missing its UTF-8 BOM. Every non-ASCII PowerShell script here needs one, otherwise Windows PowerShell 5.1 decodes it with the ANSI code page; `test_all_non_ascii_ps1_files_keep_bom` was failing on it.
+- Fixed refreshing Douyin and TikTok benchmark accounts failing with `TypeError: TiktokAdapter.fetch() got an unexpected keyword argument 'cookie_file'`: the shared fetch call site passes `cookie_file` (used by the Xiaohongshu HTTP path), but those two adapters did not accept it, so every refresh — and every monitoring sample — aborted. Both now accept the keyword, and a signature-contract test guards the adapter API.
+
+### Changed
+
+- Changed the performance-trend x-axis to start at the first day that has data instead of always spanning the last 15 days, so the first sample sits at the left edge instead of being pushed to the far right; while monitoring is active the axis still ends today, and after it stops it ends at the last sample.
+- Changed the benchmark work list from a card grid to a detail list: one row per work with the cover on the left, then title / published time / last-sampled time / original link beside it, followed by read (play), like, favorite and comment columns, a per-row monitoring switch and an actions cell (trend, download, ⋯ menu for breakdown / save-to-ideas / deep dive). Columns collapse on narrower windows and rows stack below 1100px.
+- Changed the benchmark page to use the workbench's centered content column like every other page, and widened that column to 1280px for this page only (others stay 1100px) so the seven-column work list keeps a readable title; the list drops to five columns between 1021 and 1250px and stacks below 1020px.
+
 ## [0.3.0] - 2026-10-12
 
 ### Added
