@@ -65,6 +65,61 @@ test('existing undeclared models and direct API rows omit the reasoning declarat
   assert.equal(Object.hasOwn(direct, 'thinkingFormat'), false);
 });
 
+async function saveScenario({ channel = 'chat', transport = 'openclaw', restartResult = { ok: true }, restartError } = {}) {
+  const calls = [];
+  const notes = [];
+  const saveCurrent = declarations.get('saveCurrent');
+  const callback = runInNewContext(compile(`(${saveCurrent.initializer.getText(parsed)});`), {
+    useCallback: callback => callback,
+    chan: channel,
+    chatRows: [row],
+    transRows: [row],
+    mediaRows: { image: [row] },
+    PLACEHOLDERS: new Set(),
+    fetchWithRetry: callback => callback(),
+    saveModelConfig: async () => {
+      calls.push('save');
+      return { transport, channels: { chat: { rows: [] }, transcribe: { rows: [] } } };
+    },
+    restartGateway: async () => {
+      calls.push('restart');
+      if (restartError) throw restartError;
+      return restartResult;
+    },
+    setSaving() {},
+    setSavedNote: note => notes.push(note),
+    setChatRows() {},
+    setTransRows() {},
+    setMediaRows() {},
+    refreshEnv() {},
+    setTimeout() {},
+  });
+  await callback();
+  return { calls, notes };
+}
+
+test('saving OpenClaw chat configuration restarts the gateway after saving', async () => {
+  const { calls, notes } = await saveScenario();
+  assert.deepEqual(calls, ['save', 'restart']);
+  assert.match(notes.at(-1), /新配置已生效/);
+});
+
+test('direct API and media configuration saves do not restart OpenClaw', async () => {
+  for (const scenario of [{ transport: 'api' }, { channel: 'image' }]) {
+    const { calls } = await saveScenario(scenario);
+    assert.deepEqual(calls, ['save']);
+  }
+});
+
+test('gateway restart failures preserve the successful save and report the failure', async () => {
+  for (const scenario of [{ restartResult: { ok: false, note: 'not ready' } }, { restartError: new Error('offline') }]) {
+    const { calls, notes } = await saveScenario(scenario);
+    assert.deepEqual(calls, ['save', 'restart']);
+    assert.match(notes.at(-1), /配置已保存，但网关/);
+    assert.doesNotMatch(notes.at(-1), /新配置已生效/);
+  }
+});
+
 test('new custom rows default to reasoning disabled and the OpenAI dialect', () => {
   let added;
   const callback = runInNewContext(compile(`(${addProvider.initializer.getText(parsed)});`), {

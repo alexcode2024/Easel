@@ -6,10 +6,15 @@ All notable changes to Easel are documented in this file.
 
 ### Added
 
+- Added a sanitized Linux deployment and troubleshooting record covering isolated runtimes, systemd user services, model configuration, Xiaohongshu Cookie authentication, and verification commands. See [docs/linux-deployment.md](docs/linux-deployment.md).
 - Added per-note performance monitoring to benchmark accounts: each work card has a monitoring switch that samples likes/favorites/comments once a day at a fixed time (default 09:00, editable) for up to 15 consecutive days, plus a 「📈 趋势」 button that opens line charts (likes / favorites / comments) for the last 15 days; platforms that publish view counts (TikTok) get an extra 播放量 line. Days that were not sampled stay as gaps instead of being interpolated, a failed re-sample never overwrites a good reading, and the monitor stops automatically when the 15-day window ends. See [docs/benchmarks.md](docs/benchmarks.md#5-作品表现监控15-天趋势).
 
 ### Fixed
 
+- Fixed custom OpenClaw providers being reported as unconfigured when their primary model's API key is stored in OpenClaw rather than `.env`; malformed configuration still falls back to valid environment-file credentials.
+- Fixed saved chat-model settings not taking effect in a running OpenClaw gateway: the settings panel now restarts the gateway after saving and reports restart failures without resubmitting the saved configuration. Direct-API and media configuration saves do not restart it.
+- Fixed Linux gateway restarts escaping systemd supervision: deployments using `EASEL_GATEWAY_SYSTEMD=1` restart the fixed `easel-gateway.service` user unit instead of spawning an unmanaged replacement.
+- Fixed Xiaohongshu Cookie verification and HTTP fetching missing runtime dependencies by declaring `curl-cffi`, `xhshow`, `lxml`, and `PyYAML`; added a mocked signed-Cookie identity regression test.
 - Fixed the per-work trend chart rendering only isolated dots whenever the monitored days were not consecutive: the chart used to break the line at every unsampled day, so two samples separated by a missed day produced no line at all. Observed values are now connected in date order — a segment that spans unsampled days is drawn dashed (its tooltip names both dates) so the trend is readable without inventing data points.
 - Fixed `scripts/gateway.ps1 start` reporting failure on a healthy launch: it gave up after 20 seconds while an OpenClaw cold start takes 60–90 seconds here (plugin loading plus a state-schema preflight), so the gateway came up but the command exited 1 with「启动失败」. It now polls for up to 180 seconds, matching `gateway.sh`.
 - Fixed `easel.ps1` missing its UTF-8 BOM. Every non-ASCII PowerShell script here needs one, otherwise Windows PowerShell 5.1 decodes it with the ANSI code page; `test_all_non_ascii_ps1_files_keep_bom` was failing on it.

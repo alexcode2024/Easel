@@ -153,6 +153,7 @@ def _env_key_valid() -> bool:
     以下任一通道满足即可：
     - 标准 API key：ANTHROPIC_API_KEY
     - Anthropic-compatible 服务：EASEL_LLM_API_KEY + EASEL_LLM_BASE_URL
+    - Web 自定义供应商：OpenClaw 主模型对应的 provider API key
 
     ping 才是权威连通性测试；这里只做静态配置存在性检查。
     """
@@ -164,6 +165,16 @@ def _env_key_valid() -> bool:
             return True
         except DirectAPIError:
             return False
+    try:
+        config = json.loads(_openclaw_config_path().read_text(encoding="utf-8"))
+        primary = config.get("agents", {}).get("defaults", {}).get("model", {}).get("primary", "")
+        provider_name, separator, model = primary.partition("/")
+        provider = config.get("models", {}).get("providers", {}).get(provider_name, {})
+        api_key = provider.get("apiKey", "")
+        if separator and model and isinstance(api_key, str) and api_key.strip() and "REPLACE_ME" not in api_key:
+            return True
+    except (OSError, ValueError, AttributeError, TypeError):
+        pass
     env_file = PROJECT_ROOT / ".env"
     if not env_file.is_file():
         return False
@@ -328,8 +339,8 @@ def cmd_doctor(_args) -> int:
     elif not alternate:
         # 3. .env file with valid key
         env_ok = _env_key_valid()
-        all_ok &= _check(".env (API Key)", env_ok,
-                          "填 ANTHROPIC_API_KEY，或 EASEL_LLM_API_KEY + EASEL_LLM_BASE_URL")
+        all_ok &= _check("模型认证 (.env / OpenClaw)", env_ok,
+                          "在 Web 设置 → 模型配置中填写主模型与 API Key")
 
     # 3.5 本机 agent CLI：有免 key 通道时提示用户（.env 没配也可能是绿灯路径）。
     # 不计入 all_ok —— 装不装 Claude Code 是用户的选择，不是环境故障。

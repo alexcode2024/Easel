@@ -1255,6 +1255,10 @@ export function saveModelConfig(channel: string, rows: ModelSaveRow[]): Promise<
   });
 }
 
+export function restartGateway(): Promise<{ ok: boolean; note?: string }> {
+  return request('/api/gateway/restart', { method: 'POST' });
+}
+
 export interface ModelChannelRows { rows: ModelRow[] }
 
 export interface ModelChannelsResponse {

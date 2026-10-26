@@ -6,7 +6,7 @@ import { OptionsDropdown } from './SettingsSelect';
 import type { JobView } from './EnvBoard';
 import {
   fetchEnvTools, startEnvInstall, fetchEnvJob,
-  fetchModelChannels, runChannelSelftest, saveModelConfig,
+  fetchModelChannels, runChannelSelftest, saveModelConfig, restartGateway,
   fetchLocalAgents, enableLocalAgent, fetchAvailableModels,
 } from '../lib/api';
 import type { EnvTool, ModelRow, SelftestResult, LocalAgentInfo } from '../lib/api';
@@ -308,7 +308,18 @@ export default function SettingsPanel({ onClose, banner = '' }: Props) {
         music: d.channels.music?.rows || [],
         speech: d.channels.speech?.rows || [],
       });
-      setSavedNote(d.note ? `✓ 已保存（${d.note}）` : '✓ 已保存');
+      let note = d.note ? `✓ 已保存（${d.note}）` : '✓ 已保存';
+      if (chan === 'chat' && d.transport !== 'api') {
+        setSavedNote('✓ 配置已保存，正在重启网关…');
+        try {
+          const restarted = await restartGateway();
+          note = restarted.ok ? '✓ 已保存，网关已重启，新配置已生效'
+            : `配置已保存，但网关未就绪：${restarted.note || '请稍后重试'}`;
+        } catch (error) {
+          note = `配置已保存，但网关重启失败：${error instanceof Error ? error.message : '请稍后重试'}`;
+        }
+      }
+      setSavedNote(note);
       void refreshEnv();
     } catch (e) {
       setSavedNote(e instanceof Error ? `保存失败：${e.message}` : '保存失败');

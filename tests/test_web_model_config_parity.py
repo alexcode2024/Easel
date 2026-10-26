@@ -169,6 +169,31 @@ def test_gateway_restart_takes_no_parameters() -> None:
     assert "req." not in src and "request" not in src.lower().replace("subprocess", "")
 
 
+def test_gateway_restart_uses_managed_service(monkeypatch):
+    from fastapi.testclient import TestClient
+    from types import SimpleNamespace
+
+    commands = []
+
+    def run_command(command, **kwargs):
+        commands.append(command)
+        return SimpleNamespace(stdout="gateway restarted", returncode=0)
+
+    monkeypatch.setenv("EASEL_GATEWAY_SYSTEMD", "1")
+    monkeypatch.setattr(app.sys, "platform", "linux")
+    monkeypatch.setattr(app, "_direct_api_enabled", lambda: False)
+    monkeypatch.setattr(app, "check_gateway", lambda: True)
+    monkeypatch.setattr(app.subprocess, "run", run_command)
+    local = "http://127.0.0.1:7860"
+    client = TestClient(app.app, base_url=local, client=("127.0.0.1", 51234),
+                        headers={"Origin": local})
+
+    response = client.post("/api/gateway/restart")
+
+    assert response.json()["ok"] is True
+    assert commands == [["systemctl", "--user", "restart", "easel-gateway.service"]]
+
+
 # ── role：哪一行在当主，不能写死 ──────────────────────────────────────
 
 @pytest.mark.parametrize("env_key,slot", [

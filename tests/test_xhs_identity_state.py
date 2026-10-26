@@ -10,6 +10,29 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "skills" / "shared"
 import xhs_publish
 
 
+def test_cookie_identity_uses_signed_http_dependencies(tmp_path, monkeypatch, capsys):
+    from curl_cffi import requests as curl_requests
+    from xhshow import Xhshow
+
+    cookie_file = tmp_path / "xiaohongshu.cookie"
+    cookie_file.write_text("web_session=test-session; a1=test-device", encoding="utf-8")
+    monkeypatch.setattr(Xhshow, "sign_headers_get", Mock(return_value={"x-s": "test-signature"}))
+    request = Mock(return_value=SimpleNamespace(status_code=200, json=lambda: {
+        "success": True,
+        "data": {"user_id": "self-id", "nickname": "My account", "imageb": "https://self.test/avatar"},
+    }))
+    monkeypatch.setattr(curl_requests, "get", request)
+
+    assert xhs_publish._whoami_via_cookie(str(cookie_file)) == 0
+    result = json.loads(capsys.readouterr().out)
+
+    assert result["loggedIn"] is True
+    assert result["name"] == "My account"
+    assert result["sessions"]["web"]["ok"] is True
+    assert request.call_args.kwargs["impersonate"] == "chrome"
+    assert request.call_args.kwargs["cookies"]["web_session"] == "test-session"
+
+
 def html_state(user):
     return '<script>window.__INITIAL_STATE__=' + json.dumps({
         "user": user, "feed": {"nickname": "unrelated author", "images": "https://feed.test/avatar"},

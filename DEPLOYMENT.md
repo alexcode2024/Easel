@@ -1,5 +1,7 @@
 # Easel 本机部署记录
 
+> Linux 部署、模型配置与小红书 Cookie 登录修复见 [Linux 部署与修复记录](docs/linux-deployment.md)。以下保留原 Windows 部署记录。
+
 部署目标：`https://github.com/ZJU-REAL/Easel`（main 分支，v0.3.0）
 部署位置：`C:\Projects\Easel`
 部署主机：Windows 11（简体中文，OEM 代码页 936）

@@ -1278,6 +1278,8 @@ async def api_gateway_restart():
         raise HTTPException(500, '找不到 gateway 启动脚本')
     cmd = (['powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', str(script), 'restart']
            if os.name == 'nt' else ['bash', str(script), 'restart'])
+    if sys.platform == 'linux' and os.environ.get('EASEL_GATEWAY_SYSTEMD') == '1':
+        cmd = ['systemctl', '--user', 'restart', 'easel-gateway.service']
     try:
         r = await asyncio.get_event_loop().run_in_executor(
             None,
