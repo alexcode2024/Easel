@@ -372,6 +372,7 @@ export default function BenchmarksPage({ onAskAgent, onBreakdown }: BenchmarksPa
             盯住同赛道账号在发什么、哪条跑出来了。数据来自平台<strong>公开</strong>信息，
             平台不公开的字段显示「—」，不估算。
           </p>
+          <PlatformAccessBanner statuses={platformAccess} />
         </div>
         <div style={{ display: 'flex', gap: 8 }}>
           {selected && <button className="btn btn-sm" onClick={() => setSelected(null)}>← 返回列表</button>}
@@ -433,8 +434,6 @@ export default function BenchmarksPage({ onAskAgent, onBreakdown }: BenchmarksPa
           )}
         </div>
       </div>
-
-      <PlatformAccessBanner statuses={platformAccess} />
 
       {err && <div className="bench-err">{err}</div>}
 

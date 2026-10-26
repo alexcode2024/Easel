@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useState } from 'react';
 import {
-  fetchWorkTrend, fetchMonitorStatus, runMonitorNow, saveMonitorSchedule, toggleWorkMonitor,
+  fetchWorkTrend, fetchMonitorStatus, fetchPlatformAccessStatus, runMonitorNow,
+  saveMonitorSchedule, toggleWorkMonitor,
 } from '../lib/api';
-import type { BenchTrend, BenchMonitorStatus } from '../lib/api';
+import type { BenchTrend, BenchMonitorStatus, PlatformAccessStatus } from '../lib/api';
 import { fmtDate, fmtDay, fmtValue, fmtWhen, pad2 } from '../lib/trendFormat';
 import TrendChart from './TrendChart';
+import PlatformAccessBanner from './PlatformAccessBanner';
 
 /** 每条曲线各自的颜色（浅色/深色主题下都够对比度）。 */
 const SERIES_COLOR: Record<string, string> = {
@@ -35,6 +37,8 @@ export default function WorkTrendModal({ bid, workId, workTitle, onClose, onChan
   const [busy, setBusy] = useState(false);
   const [run, setRun] = useState<BenchMonitorStatus | null>(null);
   const [poll, setPoll] = useState(false);
+  const [accessStatus, setAccessStatus] = useState<PlatformAccessStatus | null>(null);
+  const platform = trend?.account.platform || '';
 
   const reload = useCallback((): Promise<BenchTrend | null> => (
     fetchWorkTrend(bid, workId)
@@ -50,6 +54,21 @@ export default function WorkTrendModal({ bid, workId, workTitle, onClose, onChan
   ), [bid, workId]);
 
   useEffect(() => { void reload(); }, [reload]);
+
+  const refreshPlatformAccess = useCallback(async () => {
+    if (!platform) return;
+    try {
+      const statuses = await fetchPlatformAccessStatus();
+      setAccessStatus(statuses[platform] || null);
+    } catch { /* queue visibility is supplementary; keep the trend view usable */ }
+  }, [platform]);
+
+  useEffect(() => {
+    if (!platform) return;
+    void refreshPlatformAccess();
+    const timer = window.setInterval(() => { void refreshPlatformAccess(); }, 2500);
+    return () => window.clearInterval(timer);
+  }, [platform, refreshPlatformAccess]);
 
   // 采样中轮询进度：一轮可能要几十秒（逐条详情），结束后自动重拉曲线
   useEffect(() => {
@@ -87,6 +106,7 @@ export default function WorkTrendModal({ bid, workId, workTitle, onClose, onChan
       if (r.state === 'running') {
         setPoll(true);
         setMsg(r.message || '开始采样…');
+        void refreshPlatformAccess();
       } else {
         setMsg(r.message || '没有需要采样的作品');
       }
@@ -133,6 +153,10 @@ export default function WorkTrendModal({ bid, workId, workTitle, onClose, onChan
           </div>
           <button className="icon-btn" onClick={onClose} title="关闭">×</button>
         </div>
+
+        <PlatformAccessBanner
+          statuses={accessStatus ? { [accessStatus.platform]: accessStatus } : null}
+        />
 
         {!trend && !err && <div className="loading" style={{ padding: 40 }}><div className="spinner" />加载中…</div>}
         {err && <div className="bench-err" style={{ margin: '10px 0 0' }}>{err}</div>}
