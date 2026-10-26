@@ -4,7 +4,8 @@
 
 - **已下载**（``<notes-dir>/<note_id>/note.json`` 存在）→ 只重读笔记页更新 点赞/收藏/评论/分享
 - **没下载** → 读笔记页 + 下载素材（图片原图/动图 + 视频，默认**最低画质**）
-- **预算**：``--max-downloads`` 限制一次最多下载几条新作品（默认 10）。
+- **预算**：``--max-downloads`` 限制一次最多下载几条新作品（默认 5）。
+- **请求上限**：``--max-requests`` 限制一次最多读取几条作品详情（默认 8）。
   不限制的话，50 条作品首次同步会一口气拉 1-2GB，还容易把接口打到限流（实测 HTTP 461）。
 
 节流沿用参考项目标定的对数正态分布（均值 6s、最小 1s）；逐条落盘 + 写进度文件，
@@ -14,7 +15,7 @@ CLI::
 
     python xhs_sync.py --works-file outputs/_benchmarks/<bid>/works.json \\
         --notes-dir outputs/_notes --cookie-file outputs/_login/xiaohongshu.cookie \\
-        --progress-file outputs/_benchmarks/<bid>/sync.json --max-downloads 10
+        --progress-file outputs/_benchmarks/<bid>/sync.json --max-downloads 5 --max-requests 8
 """
 from __future__ import annotations
 
@@ -28,8 +29,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import xhs_note as note  # noqa: E402
+import xhs_access
 
 AVG_GAP, SIGMA = 6.0, 0.6          # 与 benchmark_fetch / xhs_fetch 同一套节流参数
+DEFAULT_MAX_REQUESTS = 8
 
 
 def gap() -> float:
@@ -68,9 +71,9 @@ def plan_sync(works: list[dict], notes_dir: Path, max_downloads: int,
     return plan
 
 
-def sync(works_file: Path, notes_dir: Path, *, cookie: str = "", max_downloads: int = 10,
+def sync(works_file: Path, notes_dir: Path, *, cookie: str = "", max_downloads: int = 5,
          quality: str = note.DEFAULT_QUALITY, progress_file: Path | None = None,
-         verbose: bool = False) -> dict:
+         verbose: bool = False, max_requests: int = DEFAULT_MAX_REQUESTS) -> dict:
     payload = json.loads(works_file.read_text(encoding="utf-8"))
     works: list[dict] = payload.get("works") or []
     index = note.load_index(notes_dir)          # 笔记ID → 「作者/标题」目录
@@ -78,7 +81,8 @@ def sync(works_file: Path, notes_dir: Path, *, cookie: str = "", max_downloads: 
     total = len(plan)
     stats = {"total": total, "updated": 0, "downloaded": 0, "failed": 0,
              "downloaded_files": 0, "downloaded_bytes": 0,
-             "skipped_due_budget": sum(1 for p in plan if p["action"] == "update" and not p["downloaded"])}
+             "skipped_due_budget": sum(1 for p in plan if p["action"] == "update" and not p["downloaded"]),
+             "skipped_due_request_budget": 0, "requests_made": 0}
     by_id = {str(w.get("id")): w for w in works}
 
     def progress(index: int, entry: dict, message: str) -> None:
@@ -92,13 +96,27 @@ def sync(works_file: Path, notes_dir: Path, *, cookie: str = "", max_downloads: 
             })
 
     for position, entry in enumerate(plan, 1):
+        if stats["requests_made"] >= max(0, int(max_requests)):
+            stats["skipped_due_request_budget"] = total - position + 1
+            break
         index = note.load_index(notes_dir)      # 下载可能刚写入新映射，逐条重读（文件很小）
         note_id = entry["note_id"]
         work = by_id.get(note_id) or {}
         token = (work.get("extra") or {}).get("xsec_token") or ""
+        stats["requests_made"] += 1
         try:
             data = note.parse_note(note_id, token, cookie=cookie)
         except Exception as error:  # noqa: BLE001 —— 单条失败不拖垮整批
+            if isinstance(error, xhs_access.RequestBudgetExhausted):
+                stats["skipped_due_request_budget"] = total - position + 1
+                break
+            if isinstance(error, xhs_access.AccessStopped) or xhs_access.RISK_PATTERN.search(str(error)):
+                xhs_access.trip("平台校验信号，本轮停止")
+                write_json(works_file, payload)
+                stats.update(risk="平台校验信号，本轮停止", error=str(error))
+                if progress_file:
+                    write_json(progress_file, {"state": "risk", "message": stats["risk"], **stats})
+                return stats
             stats["failed"] += 1
             work["sync_error"] = f"{type(error).__name__}: {error}"[:160]
             progress(position, entry, f"读取失败（{str(error)[:40]}）")
@@ -128,6 +146,13 @@ def sync(works_file: Path, notes_dir: Path, *, cookie: str = "", max_downloads: 
                 progress(position, entry,
                          f"已下载素材 {len(ok)} 个（{round(sum(int(m.get('bytes') or 0) for m in ok) / 1048576, 1)}MB）")
             except Exception as error:  # noqa: BLE001
+                if isinstance(error, xhs_access.AccessStopped) or xhs_access.RISK_PATTERN.search(str(error)):
+                    xhs_access.trip("平台校验信号，本轮停止")
+                    write_json(works_file, payload)
+                    stats.update(risk="平台校验信号，本轮停止", error=str(error))
+                    if progress_file:
+                        write_json(progress_file, {"state": "risk", "message": stats["risk"], **stats})
+                    return stats
                 stats["failed"] += 1
                 work["sync_error"] = f"下载失败：{type(error).__name__}: {error}"[:160]
                 progress(position, entry, f"下载失败（{str(error)[:40]}）")
@@ -168,12 +193,15 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--notes-dir", required=True)
     ap.add_argument("--cookie-file", default="")
     ap.add_argument("--progress-file", default="")
-    ap.add_argument("--max-downloads", type=int, default=10,
-                    help="本次最多下载几条新作品（默认 10；0 = 只更新数据不下载）")
+    ap.add_argument("--max-downloads", type=int, default=5,
+                    help="本次最多下载几条新作品（默认 5；0 = 只更新数据不下载）")
+    ap.add_argument("--max-requests", type=int, default=DEFAULT_MAX_REQUESTS,
+                    help=f"本次最多读取几条作品详情（默认 {DEFAULT_MAX_REQUESTS}）")
     ap.add_argument("--quality", default=note.DEFAULT_QUALITY,
                     help="lowest（默认，最低画质）/ best / 1080 等")
     ap.add_argument("-q", "--quiet", action="store_true")
     a = ap.parse_args(argv)
+    xhs_access._budget = max(0, a.max_requests)
 
     cookie = ""
     if a.cookie_file:
@@ -186,13 +214,13 @@ def main(argv: list[str] | None = None) -> int:
         stats = sync(Path(a.works_file), Path(a.notes_dir), cookie=cookie,
                      max_downloads=a.max_downloads, quality=a.quality,
                      progress_file=Path(a.progress_file) if a.progress_file else None,
-                     verbose=not a.quiet)
+                     verbose=not a.quiet, max_requests=max(0, a.max_requests))
     except Exception as error:  # noqa: BLE001
         print(json.dumps({"error": f"{type(error).__name__}: {error}"}, ensure_ascii=False))
         return 3
     print(json.dumps(stats, ensure_ascii=False))
-    return 0
+    return 2 if stats.get("risk") else 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(xhs_access.run_cli(main))

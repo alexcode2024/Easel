@@ -10,6 +10,10 @@ import web.app as web
 
 @pytest.fixture
 def account_state(tmp_path, monkeypatch):
+    monkeypatch.setattr(web, "BENCH_DIR", tmp_path / "bench")
+    monkeypatch.setattr(web, "SESSIONS_DIR", tmp_path / "locks")
+    monkeypatch.setattr(web, "XHS_ACCESS_QUEUE", [])
+    monkeypatch.setattr(web, "_run_xhs_command", lambda *args, **kwargs: web.subprocess.run(*args, **kwargs))
     monkeypatch.setattr(web, "LOGIN_DIR", tmp_path)
     monkeypatch.setattr(web, "LOGIN_PROCESSES", {})
     monkeypatch.setattr(web, "_WHOAMI_CACHE", {})
@@ -199,7 +203,7 @@ def test_concurrent_account_checks_share_one_browser(account_state, monkeypatch)
 
     results = asyncio.run(check())
     assert len(calls) == 1
-    assert calls[0]["timeout"] == 35
+    assert calls[0]["timeout"] == 90
     assert calls[0]["encoding"] == "utf-8"
     assert results[0] == results[1]
     assert not web._WHOAMI_TASKS

@@ -40,6 +40,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import login_state  # noqa: E402
 import login_qr
 import login_transport
+import xhs_access
 import content_guard  # noqa: E402  出站内容安全闸门
 
 # --------------------------------------------------------------------------- #
@@ -1084,6 +1085,7 @@ def _launch(p, headed: bool, base: str | None, proxy: str | None, *, login_asset
     for attempt in range(2):
         try:
             context = p.chromium.launch_persistent_context(str(profile), **kwargs)
+            xhs_access.install_browser_guard(context)
             if login_assets:
                 login_transport.install(context, "xiaohongshu")
             return context
@@ -1535,7 +1537,7 @@ def _whoami_via_cookie(cookie_file: str) -> int:
             "referer": "https://www.xiaohongshu.com/",
             "user-agent": xhs_fetch.UA,
         }
-        response = creq.get(url, headers=headers, cookies=jar, timeout=20, verify=False,
+        response = xhs_access.request(creq.get, url, headers=headers, cookies=jar, timeout=20, verify=False,
                             allow_redirects=True, impersonate="chrome")
         body = response.json() if response.status_code == 200 else {}
         data = body.get("data") or {}
@@ -1743,4 +1745,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(xhs_access.run_cli(main))

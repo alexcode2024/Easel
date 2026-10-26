@@ -16,7 +16,7 @@
 浏览器 ──POST /api/benchmarks/{bid}/fetch──▶ 后端 benchmark_fetch.py fetch
                                               │  ① 平台适配器抓列表（含账号指标）
                                               │  ② 写 works.json / accounts.json / history.jsonl
-                                              │  ③（小红书）xhs_sync.py 同步素材
+                                              │  ③（显式 sync=true）xhs_sync.py 同步素材
                                               ▼
 前端 ◀──GET /api/benchmarks、/api/benchmarks/{bid}── 读本地快照（**列表接口永不触发抓取**）
 ```
@@ -57,10 +57,12 @@ outputs/_benchmarks/
 
 ### 1.4 约束（都是踩过坑之后定下来的）
 
-- **串行**：同一账号同时只跑一个任务（`BENCH_RUNNING`），批量刷新也是串行，绝不并发——并发读会招平台风控。
+- **共用一个并发槽位**：当前项目仅配置一份小红书 Cookie/浏览器登录态，所以所有小红书任务共用队列，不按对标账号 ID 分锁。刷新、深挖、下载、监控（含首采）、登录/会话校验、创作数据和发布相互串行；扫码登录占用槽位直到浏览器进程退出。
+- **脚本直调保护**：`xhs_access.py` 的跨进程文件锁覆盖小红书采集、评论、登录、发布等 CLI 入口，避免 Agent 直调绕开 Web。取消 Web 任务时，要等正在执行的线程/子进程结束才释放槽位。排队任务只保存在内存，服务重启后不自动重放。
 - **冷却 300 秒**：`BENCH_COOLDOWN`，同一账号两次抓取的最小间隔；冷却期内接口返回 429，前端显示倒计时。
-- **小红书最多 50 条**：主页 SSR 一次只给 30 条，多出来的走签名分页接口；再往上不做（避免变成全量搬运）。
-- **命中风控立即停**：识别到 `300012`、「风险」、「风控」等信号就熔断，**不重试**——重试会把软限流升级成数小时封禁。
+- **默认只取 20 条列表**：刷新不默认深挖、同步或下载；已有详情优先复用，监控才主动读取新快照。批量深挖/单轮监控最多 20 条，显式同步最多读取 8 条详情、默认补下 5 条新作品素材。
+- **共享熔断**：HTTP `429` / `461`、`300012`、`NeedVerify`、验证码及访问频繁等信号会触发一小时暂停，状态保存到 `outputs/_benchmarks/xhs_access.json`，重启不清除；等待中的任务终止，本轮不重试，也不换成游客身份继续访问。冷却结束只是允许新任务，不代表平台已经解除限制。
+- **请求节流**：小红书数据请求共用持久化的请求完成时间，下一次请求随机等待 10–30 秒；首个请求也等待。默认 CLI 数据请求预算为 20，列表抓取为 8，显式同步详情为 8。静态资源和媒体文件不计入详情请求预算。
 - **超时**：单账号抓取 `BENCH_FETCH_TIMEOUT=300s`；同步 `BENCH_SYNC_TIMEOUT=3600s`。
 - **数据保护**：
   - 刷新时按作品 ID **保留已深挖的收藏/评论**，并自愈「标记完成但没数据」的残留；
@@ -75,12 +77,13 @@ outputs/_benchmarks/
 | POST | `/api/benchmarks` | `platform`、`target`、`remark`、`tags` | 新增账号（先 `parse_target` 归一，重复会拒绝） |
 | DELETE | `/api/benchmarks/{bid}` | — | 删除账号 + 作品 + 封面缓存（**素材目录不删**） |
 | GET | `/api/benchmarks/{bid}` | — | 详情：账号 + 作品列表（含 `downloaded`/`download` 摘要）+ 覆盖说明 + 状态 |
-| POST | `/api/benchmarks/{bid}/fetch` | `sync`（默认 true）、`max_downloads` | 触发抓取（异步）；小红书顺带同步素材 |
+| POST | `/api/benchmarks/{bid}/fetch` | `sync`（默认 false）、`max_downloads` | 默认只刷新列表；显式开启同步才读取详情/素材 |
 | GET | `/api/benchmarks/{bid}/fetch/status` | — | 抓取/同步进度（`state`、`message`、`running`、`cooldown_left`） |
 | POST | `/api/benchmarks/fetch-all` | — | 串行刷新全部可自动抓取的账号 |
 | GET | `/api/benchmarks/fetch-all/status` | — | 批量刷新进度 |
 | POST | `/api/benchmarks/{bid}/works/{wid}/detail` | — | 单条深挖（补收藏/评论） |
-| POST | `/api/benchmarks/{bid}/works/detail-batch` | `limit`（0=全部待补，上限 40） | 批量深挖，串行 + 6 秒间隔，风控即停 |
+| POST | `/api/benchmarks/{bid}/works/detail-batch` | `limit`（0=待补，上限 20） | 批量深挖，串行节流，风控即停 |
+| GET | `/api/xhs/access/status` | — | 并发上限、当前任务、排队位置、熔断原因与恢复时间；不返回凭证 |
 | POST | `/api/benchmarks/{bid}/works/{wid}/download` | `quality`（默认 `lowest`） | 下载这条笔记的全部素材与记录 |
 | POST | `/api/benchmarks/{bid}/works/{wid}/monitor` | body `{"enabled": bool}` | 开/关这篇作品的表现监控（开启时顺手记当天第一个点） |
 | GET | `/api/benchmarks/{bid}/works/{wid}/trend` | `days`（默认 15，上限 15） | 最近 N 天的点赞/收藏/评论三条序列 |
@@ -110,7 +113,7 @@ outputs/_benchmarks/
 
 | 用途 | 接口 | 说明 |
 |---|---|---|
-| **会话校验 / 我是谁** | `GET /api/sns/web/v2/user/me` | 返回 `nickname`、`red_id`、`user_id`、头像。约 1 秒，是「检查会话」按钮的实现 |
+| **会话校验 / 我是谁** | `GET /api/sns/web/v2/user/me` | 返回 `nickname`、`red_id`、`user_id`、头像。「检查会话」也遵守队列及 10–30 秒请求间隔 |
 | **账号指标** | `GET /api/sns/web/v1/user/otherinfo?target_user_id=` | 粉丝（精确整数）、获赞、收藏、作品数、昵称、头像。**带 cookie 时主页 SSR 是空壳，指标只能走这里** |
 | **作品列表（分页）** | `GET /api/sns/web/v1/user_posted?user_id=&cursor=&num=30` | 游标分页；字段是**顶层蛇形**（`note_id`/`display_title`/`interact_info`），与 SSR 的驼峰形态不同 |
 | **单条笔记详情** | 笔记页 HTML 的 `__INITIAL_STATE__` | `note.noteDetailMap[-1].note` |
@@ -136,7 +139,7 @@ outputs/_benchmarks/
 | GET | `/api/benchmarks/cookies` | 各平台 cookie 状态（`saved`、`cookie_count`、`has_required`、`missing`、`saved_at`） |
 | POST | `/api/benchmarks/cookies/{platform}` | body `{"cookie": "..."}`；小红书**必须含 `web_session`**，否则 400 |
 | DELETE | `/api/benchmarks/cookies/{platform}` | 清除 |
-| GET | `/api/accounts/{platform}/session` | 会话健康：`web`（主站读数据）与 `creator`（创作平台发布）分开返回；`?check=1` 强制实测（约 1 秒） |
+| GET | `/api/accounts/{platform}/session` | 会话健康：`web`（主站读数据）与 `creator`（创作平台发布）分开返回；`?check=1` 强制实测，也需等待队列及请求间隔 |
 
 脚本侧：`xhs_publish.py whoami --cookie-file <f>`、`benchmark_fetch.py fetch --cookie-file <f>`、
 `xhs_note.py download --notes-dir <d> --cookie-file <f>`。
@@ -189,31 +192,33 @@ outputs/_notes/
 
 ### 4.1 规则
 
-点「获取最新作品（含同步）」后，除了抓列表，还会逐条：
+默认点「获取最新作品」只更新列表。界面选择同步 3 / 5 条，或 API 显式传 `sync=true` 后才会逐条：
 
 - **没下载过** → 读笔记页 + 下载素材（媒体文件）；
 - **已下载** → 只重读笔记页，更新点赞/收藏/评论/分享，**并刷新本地 `note.json` 里的互动数据**（让归档不停在旧数字）。
 
 ### 4.2 预算（防止一次拉 1–2GB）
 
-`max_downloads`（界面「同步下载」下拉）：`0` = 只更新数据不下素材 / `5` / `10`（**默认**）/ `20` / `999`（全部补齐）。
-超预算的作品只更新数据，并在完成消息里提示「还有 N 条未下载（本次预算 X 条）」。
+界面默认「仅刷新列表」，可显式选最多 3 / 5 条新作品素材。API 的 `max_downloads` 默认 5；仅在 `sync=true` 时生效，传 0 表示只更新详情、不下载。
+同步还受 `--max-requests=8` 限制，已下载作品也会消耗详情读取预算，达到预算立即停止，并保留已完成的数据。
 
 ### 4.3 节流与落盘
 
-- 每条之间 **对数正态间隔，均值 6 秒、最小 1 秒**（沿用成熟工具的标定，不自己造更激进的参数）。
+- 保留原有任务级抖动间隔，并对实际小红书数据请求施加全局 10–30 秒节流。
 - **逐条落盘** `works.json`：中途中断/失败不丢已完成部分。
-- **单条失败不拖垮整批**：记 `sync_error` 继续下一条。
+- 普通单条失败记 `sync_error`；风控/验证码立即停止整批，不访问后续作品。
 - 进度直接写进 `outputs/_benchmarks/<bid>/fetch.json`（前端本来就在轮询这个文件），所以界面无需额外接口就有「同步 7/50：已更新互动数据」。
 
 ### 4.4 参数
 
 | 位置 | 参数 | 默认 | 含义 |
 |---|---|---|---|
-| `POST /api/benchmarks/{bid}/fetch` | `sync` | `true` | 是否在抓列表后同步素材 |
-| 同上 | `max_downloads` | `10` | 本次最多下载几条新作品 |
+| `POST /api/benchmarks/{bid}/fetch` | `sync` | `false` | 是否在抓列表后同步素材 |
+| 同上 | `max_downloads` | `5` | 本次最多下载几条新作品 |
 | `POST .../works/{wid}/download` | `quality` | `lowest` | 画质：`lowest` / `best` / `1080` 等 |
-| `POST .../works/detail-batch` | `limit` | `0`（全部待补） | 批量深挖条数，上限 40 |
+| `POST .../works/detail-batch` | `limit` | `0`（待补） | 批量深挖条数，上限 20 |
+| `xhs_fetch.py` | `--request-budget` | `8` | 本轮列表/指标数据请求上限 |
+| `xhs_sync.py` | `--max-requests` | `8` | 本轮详情读取上限，已下载作品同样计数 |
 | `xhs_sync.py` | `--works-file`、`--notes-dir`、`--progress-file`、`--max-downloads`、`--quality`、`--cookie-file` | — | 脚本直调 |
 | `xhs_note.py` | `--note-id`、`--xsec-token`、`--notes-dir`/`--out-dir`、`--quality`、`--no-images`/`--no-video`/`--no-live`、`--cookie-file` | — | 脚本直调（`parse` / `download` 两个子命令） |
 
@@ -305,7 +310,7 @@ outputs/_notes/
 ## 6. 风控与合规红线
 
 1. **不绕过平台风控**：命中风控立即停止、不重试、不换手段继续打；不伪装成真人去骗过检测。
-2. **串行 + 冷却**：任何时刻同一平台只有一条请求链在跑；抓取有 5 分钟冷却，同步/深挖有 6 秒均值的抖动间隔。
+2. **串行 + 冷却**：本项目中同一小红书登录态只有一条任务链运行；抓取有 5 分钟冷却，数据请求另有 10–30 秒共享节流。外部浏览器、其他项目及其他机器的访问不在本项目控制范围内；串行只能降低风险，不能保证不会被平台限制。
 3. **不做批量搬运**：单条按需下载；主页作品列表最多取最新 50 条；不提供"整号导出"。
 4. **不登录他人账号、不模拟互动**：只读公开页面，不点赞、不关注、不发评论。
 5. **如实标注**：拿不到的字段显示「—」而不是估算；游客态明确告警；导出文件带版权声明。
@@ -332,7 +337,7 @@ outputs/_notes/
 
 ## 8. 已知限制
 
-- **不做全量翻页**：小红书作品列表上限 50 条（平台单次给 30，分页补到 50 即停）。
+- **不做全量翻页**：小红书作品列表默认只取最近 20 条，不做历史全量采集。
 - **作品级收藏/评论需逐条深挖**：主页列表只给点赞，深挖是"每条一次请求"，所以默认不放进刷新流程（有单独按钮 + 预算）。
 - **小红书无头不可用**：任何依赖 Playwright 无头内核的小红书操作都会被判 300012，别再尝试。
 - **抖音/TikTok 仍走浏览器适配器**：它们的收藏/评论随列表返回，但取数依赖有头浏览器（抖音需 `sec_uid`，TikTok 需能访问的网络）。

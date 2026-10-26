@@ -778,6 +778,19 @@ export interface BenchStatus {
   cooldown_left?: number;
 }
 
+export interface XhsAccessStatus {
+  resource: 'xiaohongshu';
+  concurrency: 1;
+  active: { id: string; label: string; started_at: number } | null;
+  queue: { id: string; label: string; state: 'queued'; position: number; queued_at: number }[];
+  queued: number;
+  risk: { active: boolean; until: number; reason: string; triggered_at: number };
+}
+
+export function fetchXhsAccessStatus(): Promise<XhsAccessStatus> {
+  return request('/api/xhs/access/status');
+}
+
 export interface BenchAccount {
   id: string;
   platform: string;
@@ -903,10 +916,10 @@ export function deleteBenchmark(id: string): Promise<{ ok: boolean; deleted: str
   return request(`/api/benchmarks/${encodeURIComponent(id)}`, { method: 'DELETE' });
 }
 
-/** 触发一次抓取（异步；抓一次 30s～几分钟，随后轮询 status）。
- *  小红书会顺带同步素材：maxDownloads = 本次最多补下几条新作品（0 = 只更新数据不下素材）。 */
+/** 默认只刷新作品列表；maxDownloads > 0 时显式启用按预算同步。 */
 export function fetchBenchmarkNow(id: string, maxDownloads?: number): Promise<BenchStatus> {
-  const q = maxDownloads === undefined ? '' : `?max_downloads=${maxDownloads}`;
+  const sync = maxDownloads !== undefined && maxDownloads > 0;
+  const q = maxDownloads === undefined ? '' : `?sync=${sync}&max_downloads=${maxDownloads}`;
   return request(`/api/benchmarks/${encodeURIComponent(id)}/fetch${q}`, { method: 'POST' });
 }
 
@@ -932,7 +945,7 @@ export function fetchBenchmarkWorkDetail(id: string, workId: string): Promise<Be
 }
 
 /** 批量补齐收藏/评论：逐条打开作品页读取（串行 + 间隔，命中风控即停）。
- *  limit 省略 = 把待补的全部补完（后端上限 40 条）。 */
+ *  limit 省略 = 补齐待补作品（每轮上限 20 条）。 */
 export function fetchBenchmarkWorksDetailBatch(id: string, limit = 0): Promise<{
   state: string; total?: number; pending?: number; message?: string; reused?: boolean;
 }> {

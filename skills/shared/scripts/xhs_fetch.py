@@ -33,7 +33,7 @@ Design notes (why it looks like this)
 
 Usage
 -----
-    python xhs_fetch.py --user-id 55753cf4f5a2633511d5a652 [--limit 50]
+    python xhs_fetch.py --user-id 55753cf4f5a2633511d5a652 [--limit 20]
                         [--details N] [--json OUT]
                         [--min-delay 10] [--max-delay 30]
                         [--anonymous] [--no-fallback]
@@ -51,6 +51,7 @@ import re
 import sys
 import time
 from pathlib import Path
+import xhs_access
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -68,6 +69,7 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 STEADY_MIN = 10.0
 STEADY_MAX = 30.0
 FAST_CEILING = 5.0
+DEFAULT_REQUEST_BUDGET = 8
 
 # Markers that mean "stop now", never "retry".
 # Deliberately specific: a bare "verify" matches ordinary bundle/JS identifiers
@@ -95,11 +97,11 @@ class Throttle:
     def __init__(self, min_delay: float, max_delay: float) -> None:
         self.min_delay = min_delay
         self.max_delay = max_delay
-        self.last_at: float | None = None
+        self.last_at: float | None = time.time()
         self.count = 0
 
     def wait(self) -> None:
-        if self.last_at is not None:
+        if self.last_at is not None and not xhs_access._depth:
             delay = random.uniform(self.min_delay, self.max_delay)
             time.sleep(delay)
         self.last_at = time.time()
@@ -179,7 +181,7 @@ def _http_get(url: str, cookie: str = "", *, impersonate: str = "chrome", timeou
         "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
         "referer": "https://www.xiaohongshu.com/",
     }
-    return creq.get(url, headers=headers, cookies=parse_cookie(cookie) if cookie else None,
+    return xhs_access.request(creq.get, url, headers=headers, cookies=parse_cookie(cookie) if cookie else None,
                     timeout=timeout, verify=False, allow_redirects=True, impersonate=impersonate)
 
 
@@ -314,7 +316,7 @@ def _signed_api_get(endpoint: str, params: dict, cookie: str, *, timeout: int = 
         "sec-fetch-dest": "empty", "sec-fetch-mode": "cors", "sec-fetch-site": "same-site",
         "user-agent": UA,
     }
-    return creq.get(url, headers=headers, cookies=jar, timeout=timeout, verify=False,
+    return xhs_access.request(creq.get, url, headers=headers, cookies=jar, timeout=timeout, verify=False,
                     allow_redirects=True, impersonate="chrome")
 
 
@@ -349,14 +351,13 @@ def fetch_otherinfo(user_id: str, cookie: str) -> dict:
     }
 
 
-def fetch_profile_api(user_id: str, cookie: str, *, limit: int = 50,
+def fetch_profile_api(user_id: str, cookie: str, *, limit: int = 20,
                       threshold: tuple[float, float] = (STEADY_MIN, STEADY_MAX),
-                      verbose: bool = False) -> dict:
+                      verbose: bool = False, request_budget: int = DEFAULT_REQUEST_BUDGET) -> dict:
     """带 cookie 的完整取数：**指标走 otherinfo 接口 + 作品走 user_posted 分页接口**。
 
     主页 SSR 在登录态下是空壳，这条路（本函数）才是带 cookie 时的正路。
-    列表接口被限流（实测 ``HTTP 461``）时**退回游客 SSR 拿一批**并如实告警——
-    游客 SSR 不带 cookie 才有数据，所以退回时显式去掉 cookie。
+    风控或限流时立即停止，不回退游客身份继续访问。
     """
     log: list[str] = []
     warnings: list[str] = []
@@ -364,22 +365,33 @@ def fetch_profile_api(user_id: str, cookie: str, *, limit: int = 50,
     pages = 0
     listed_via_api = False
     try:
+        throttle = Throttle(*threshold)
+        throttle.wait()
         info = fetch_otherinfo(user_id, cookie)
         log.append(f"[i] 账号指标（otherinfo）：粉丝 {info.get('fans_raw')}，"
                    f"获赞 {info.get('liked_exact')}，收藏 {info.get('collected_exact')}，"
                    f"作品 {info.get('posted_exact')}")
     except Exception as error:  # noqa: BLE001
+        if isinstance(error, xhs_access.AccessStopped) or xhs_access.RISK_PATTERN.search(str(error)):
+            if isinstance(error, xhs_access.RequestBudgetExhausted):
+                raise
+            raise xhs_access.AccessStopped("账号指标触发平台校验，本轮停止") from error
         info = {}
         warnings.append(f"账号指标接口失败：{type(error).__name__}: {error}")
     try:
         paged = fetch_profile_paged(user_id, cookie, limit=limit, threshold=threshold,
-                                    verbose=verbose)
+                                    throttle=throttle,
+                                    verbose=verbose, max_requests=max(0, request_budget - 1))
         notes, pages = paged["notes"], paged["pages"]
         listed_via_api = True
         log += paged.get("request_log") or []
         if paged.get("risk_control"):
-            warnings.append(f"列表接口命中风控信号：{paged['risk_control']}")
+            raise xhs_access.AccessStopped(f"列表接口命中风控信号：{paged['risk_control']}")
     except Exception as error:  # noqa: BLE001
+        if isinstance(error, xhs_access.AccessStopped) or xhs_access.RISK_PATTERN.search(str(error)):
+            if isinstance(error, xhs_access.RequestBudgetExhausted):
+                raise
+            raise xhs_access.AccessStopped("作品列表触发平台校验，本轮停止") from error
         logger = f"[!] 作品列表接口不可用（{type(error).__name__}: {error}）"
         log.append(logger)
         # 退回游客 SSR：显式不带 cookie，因为带 cookie 时主页是空壳
@@ -408,12 +420,15 @@ def fetch_profile_api(user_id: str, cookie: str, *, limit: int = 50,
     }
     return {"mode": "http+api", "profile": profile, "notes": notes,
             "paging": {"pages": pages} if (pages and listed_via_api) else {},
-            "warnings": warnings, "request_log": log}
+            "warnings": warnings, "request_log": log,
+            "requests_made": throttle.count if 'throttle' in locals() else 0}
 
 
 def fetch_profile_paged(user_id: str, cookie: str, *, limit: int = 0,
                         threshold: tuple[float, float] = (STEADY_MIN, STEADY_MAX),
-                        verbose: bool = False, max_pages: int = 40) -> dict:
+                        verbose: bool = False, max_pages: int = 40,
+                        throttle: Throttle | None = None,
+                        max_requests: int = DEFAULT_REQUEST_BUDGET) -> dict:
     """纯 HTTP **翻页**读主页全部作品（走签名接口 ``user_posted``）。
 
     主页 SSR 一次只给 30 条；要拿全量必须调分页接口，而该接口需要 ``x-s``/``x-s-common``
@@ -440,19 +455,25 @@ def fetch_profile_paged(user_id: str, cookie: str, *, limit: int = 0,
         "sec-fetch-dest": "empty", "sec-fetch-mode": "cors", "sec-fetch-site": "same-site",
         "user-agent": UA,
     }
-    throttle = Throttle(*threshold)
+    throttle = throttle or Throttle(*threshold)
     notes: list[dict] = []
     seen: set[str] = set()
     cursor = ""
     log: list[str] = []
     risk: str | None = None
     pages = 0
+    budget_exhausted = False
     while pages < max_pages:
+        if pages >= max(0, max_requests):
+            budget_exhausted = True
+            log.append(f"[i] 已达到本次请求预算 {max_requests}，停止翻页")
+            break
         params = {"num": 30, "cursor": cursor, "user_id": user_id,
                   "image_formats": "jpg,webp,avif", "xsec_token": "", "xsec_source": ""}
         url = signer.build_url(endpoint, params)      # 必须用库的 URL：签名覆盖查询串
         headers = signer.sign_headers_get(uri=endpoint, cookies=jar, params=params)
-        response = creq.get(url, headers=headers | common_headers, cookies=jar, timeout=25,
+        throttle.wait()
+        response = xhs_access.request(creq.get, url, headers=headers | common_headers, cookies=jar, timeout=25,
                             verify=False, allow_redirects=True, impersonate="chrome")
         pages += 1
         if response.status_code != 200:
@@ -485,10 +506,10 @@ def fetch_profile_paged(user_id: str, cookie: str, *, limit: int = 0,
         if not cursor:
             log.append("[i] 无下一页游标，停止翻页")
             break
-        throttle.wait()
     return {"mode": "http+paged", "notes": notes, "pages": pages,
-            "complete": not risk and pages < max_pages,
-            "request_log": log, "risk_control": risk}
+            "complete": not risk and not budget_exhausted and pages < max_pages,
+            "request_log": log, "risk_control": risk,
+            "requests_made": throttle.count, "budget_exhausted": budget_exhausted}
 
 
 def _normalize_note(item: dict) -> dict | None:
@@ -731,6 +752,7 @@ def fetch(user_id: str, *, anonymous: bool, throttle: Throttle, limit: int,
                     ctx = p.chromium.launch_persistent_context(str(profile), **launch_kwargs)
                     ctx_kind = "logged-in (persistent profile)"
 
+            xhs_access.install_browser_guard(ctx)
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
             page.add_init_script(
                 "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
@@ -746,7 +768,7 @@ def fetch(user_id: str, *, anonymous: bool, throttle: Throttle, limit: int,
                 log.append(f"[!] 预热导航失败（继续）：{e}")
 
             throttle.wait()
-            resp = ctx.request.get(url, headers={"Referer": "https://www.xiaohongshu.com/"},
+            resp = xhs_access.request(ctx.request.get, url, headers={"Referer": "https://www.xiaohongshu.com/"},
                                    timeout=25000)
             body = resp.text()
             log.append(f"[i] {ctx_kind} → status={resp.status} bytes={len(body)}")
@@ -788,7 +810,7 @@ def fetch(user_id: str, *, anonymous: bool, throttle: Throttle, limit: int,
                     durl = (f"https://www.xiaohongshu.com/explore/{n['note_id']}"
                             f"?xsec_token={n['xsec_token']}&xsec_source=pc_user")
                     try:
-                        dr = ctx.request.get(durl, headers={"Referer": url}, timeout=25000)
+                        dr = xhs_access.request(ctx.request.get, durl, headers={"Referer": url}, timeout=25000)
                         dbody = dr.text()
                         dhit = _risk_hit(dbody)
                         if dhit:
@@ -824,7 +846,9 @@ def fetch(user_id: str, *, anonymous: bool, throttle: Throttle, limit: int,
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="抓取小红书创作者主页（带登录态优先）")
     ap.add_argument("--user-id", required=True, help="24 位 user_id（主页 URL 里那段）")
-    ap.add_argument("--limit", type=int, default=50, help="最多取多少篇（默认 50）")
+    ap.add_argument("--limit", type=int, default=20, help="最多取多少篇（默认 20）")
+    ap.add_argument("--request-budget", type=int, default=DEFAULT_REQUEST_BUDGET,
+                    help=f"本次最多请求数（默认 {DEFAULT_REQUEST_BUDGET}）")
     ap.add_argument("--details", type=int, default=0,
                     help="额外读取前 N 篇的笔记详情（默认 0，每篇一次请求）")
     ap.add_argument("--min-delay", type=float, default=STEADY_MIN,
@@ -839,6 +863,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--json", dest="json_out", help="把结果写到该文件")
     ap.add_argument("-q", "--quiet", action="store_true")
     a = ap.parse_args(argv)
+    xhs_access._budget = max(1, a.request_budget)
 
     if not re.fullmatch(r"[0-9a-f]{24}", a.user_id or ""):
         print(f"user_id 格式不对（需 24 位十六进制）：{a.user_id}")
@@ -873,10 +898,13 @@ def main(argv: list[str] | None = None) -> int:
         # 指标走 otherinfo 接口、作品走 user_posted 分页接口 —— 因为**带 cookie 时
         # 主页 SSR 是登录态空壳**（实测 10KB、没有 __INITIAL_STATE__），读不到任何数据。
         try:
-            result = fetch_profile_api(a.user_id, cookie, limit=max(int(a.limit or 50), 30),
+            result = fetch_profile_api(a.user_id, cookie, limit=max(int(a.limit or 20), 20),
                                        threshold=(a.min_delay, a.max_delay),
-                                       verbose=not a.quiet)
+                                       verbose=not a.quiet,
+                                       request_budget=max(1, a.request_budget))
         except Exception as error:  # noqa: BLE001
+            if isinstance(error, xhs_access.AccessStopped):
+                raise
             print(f"ERROR: 纯 HTTP 取数失败：{type(error).__name__}: {error}", file=sys.stderr)
             return 3
         result["notes"] = (result.get("notes") or [])[:a.limit] if a.limit else result.get("notes") or []
@@ -908,7 +936,7 @@ def main(argv: list[str] | None = None) -> int:
 
     result["request_log"] = log
     result["throttle"] = throttle.describe()
-    result["requests_made"] = throttle.count
+    result["requests_made"] = result.get("requests_made", throttle.count)
     if risk:
         result["risk_control"] = risk
 
@@ -942,4 +970,4 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(xhs_access.run_cli(main))

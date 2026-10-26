@@ -1224,4 +1224,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    import xhs_access
+    sys.exit(xhs_access.run_cli(main, enabled="xiaohongshu" in sys.argv))

@@ -30,6 +30,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import xhs_fetch as xf  # noqa: E402  复用 HTTP（指纹伪装）与 YAML 解析
+import xhs_access
 
 __all__ = ["parse_note", "download_note", "pick_video", "image_original_url", "guess_ext"]
 
@@ -317,10 +318,15 @@ def _download(urls, dest: Path, *, referer: str, limit: int = MAX_FILE_BYTES) ->
         result["tries"] += 1
         response = None
         try:
+            if xhs_access._depth:
+                xhs_access.check_breaker()
             result["url"] = url
             # 注意：curl_cffi 的 Response 不支持 with 语句（实测 TypeError），手动关闭
             response = creq.get(url, headers={"referer": referer}, timeout=180, verify=False,
                                 allow_redirects=True, impersonate="chrome", stream=True)
+            if response.status_code in (429, 461):
+                xhs_access.trip(f"HTTP {response.status_code}")
+                raise xhs_access.AccessStopped(f"HTTP {response.status_code}")
             if response.status_code not in (200, 206):
                 last_error = f"HTTP {response.status_code}"
                 continue
@@ -348,6 +354,9 @@ def _download(urls, dest: Path, *, referer: str, limit: int = MAX_FILE_BYTES) ->
             part.replace(final)
             result.update({"path": final.name, "bytes": final.stat().st_size, "error": ""})
             return result
+        except xhs_access.AccessStopped:
+            part.unlink(missing_ok=True)
+            raise
         except Exception as error:  # noqa: BLE001
             last_error = f"{type(error).__name__}: {error}"
             part.unlink(missing_ok=True)
@@ -544,4 +553,4 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(xhs_access.run_cli(main))

@@ -3,15 +3,18 @@ import {
   fetchBenchPlatforms, fetchBenchmarks, fetchBenchmark, createBenchmark, deleteBenchmark,
   fetchBenchmarkNow, fetchBenchmarkWorkDetail, fetchBenchmarkWorksDetailBatch,
   fetchAllBenchmarks, benchmarkFetchAllStatus,
+  fetchXhsAccessStatus,
   fetchBenchCookies, downloadBenchWork,
   fetchMonitorSchedule, fetchMonitorStatus, runMonitorNow, toggleWorkMonitor,
   mediaUrl, createIdea,
 } from '../lib/api';
 import type {
   BenchAccount, BenchDetail, BenchPlatform, BenchWork, BenchCookieStatus, BenchMonitorSchedule,
+  XhsAccessStatus,
 } from '../lib/api';
 import CookieModal from './CookieModal';
 import WorkTrendModal from './WorkTrendModal';
+import XhsAccessBanner from './XhsAccessBanner';
 import { fmtDateTime, fmtWhen, pad2 } from '../lib/trendFormat';
 import { IconAccounts, IconTrash, IconChevron, IconChat } from './icons';
 
@@ -68,8 +71,9 @@ export default function BenchmarksPage({ onAskAgent, onBreakdown }: BenchmarksPa
   const [bulk, setBulk] = useState<{ running: boolean; done: number; total: number } | null>(null);
   const [showAllWorks, setShowAllWorks] = useState(false);
   const [busyWork, setBusyWork] = useState('');
-  const [syncBudget, setSyncBudget] = useState(10);   // 刷新时最多补下几条新作品的素材
+  const [syncBudget, setSyncBudget] = useState(0);
   const [cookies, setCookies] = useState<BenchCookieStatus[]>([]);
+  const [xhsAccess, setXhsAccess] = useState<XhsAccessStatus | null>(null);
   const [cookieForm, setCookieForm] = useState<{ platform: string; value: string } | null>(null);
   // 表现监控：设置（每天几点采样）+ 正在跑的那一轮进度；趋势弹窗针对单篇作品
   const [monitorInfo, setMonitorInfo] = useState<BenchMonitorSchedule | null>(null);
@@ -96,6 +100,10 @@ export default function BenchmarksPage({ onAskAgent, onBreakdown }: BenchmarksPa
     fetchBenchmarks().then(setAccounts).catch((e) => setErr(String(e.message || e)));
   }, []);
 
+  const loadXhsAccess = useCallback(() => {
+    fetchXhsAccessStatus().then(setXhsAccess).catch(() => setXhsAccess(null));
+  }, []);
+
   const loadDetail = useCallback((id: string) => {
     fetchBenchmark(id).then(setDetail).catch((e) => setErr(String(e.message || e)));
   }, []);
@@ -115,6 +123,11 @@ export default function BenchmarksPage({ onAskAgent, onBreakdown }: BenchmarksPa
   }, []);
 
   useEffect(() => { loadMonitorInfo(); }, [loadMonitorInfo]);
+  useEffect(() => {
+    loadXhsAccess();
+    const timer = window.setInterval(loadXhsAccess, 3000);
+    return () => window.clearInterval(timer);
+  }, [loadXhsAccess]);
 
   // 作品行的 「⋯」菜单：Esc 关闭（点空白由遮罩负责）
   useEffect(() => {
@@ -175,12 +188,13 @@ export default function BenchmarksPage({ onAskAgent, onBreakdown }: BenchmarksPa
         if (selected) loadDetail(selected);
         const b = await benchmarkFetchAllStatus();
         setBulk((prev) => (prev ? { ...prev, running: b.running, done: b.done, total: b.total } : prev));
+        loadXhsAccess();
       } catch { /* 轮询失败忽略，下轮再试 */ }
     }, 3000);
     return () => {
       if (pollRef.current) { window.clearInterval(pollRef.current); pollRef.current = null; }
     };
-  }, [accounts, bulk, selected, loadDetail]);
+  }, [accounts, bulk, selected, loadDetail, loadXhsAccess]);
 
   const platMeta = useMemo(() => {
     const map: Record<string, BenchPlatform> = {};
@@ -385,13 +399,14 @@ export default function BenchmarksPage({ onAskAgent, onBreakdown }: BenchmarksPa
                 const pending = detail.works.filter((w) => w.id && !(
                   w.detail_fetched && (w.favorites !== null || w.comments !== null))).length;
                 if (pending === 0) return null;
-                const mins = Math.max(1, Math.round(pending * 7 / 60));   // 纯 HTTP：每条约 0.5s + 6s 间隔
+                const batchSize = Math.min(pending, 20);
+                const mins = Math.max(1, Math.ceil(batchSize * 26 / 60));
                 return (
                   <button className="btn btn-sm" onClick={deepDiveBatch}
                     disabled={detail.account.running || detail.fetch?.state === 'running'}
-                    title={`逐条读取收藏/评论（纯 HTTP，不用浏览器）：每条约 6 秒，共 ${pending} 条约 ${mins} 分钟。` +
+                    title={`逐条读取收藏/评论：本轮最多 ${batchSize} 条，约 ${mins} 分钟；实际耗时受排队和网络影响。` +
                            `串行不并发；命中平台风控会立即停止，已完成的部分会保留。`}>
-                    ⟳ 补齐收藏/评论（{pending} 条{pending > 1 ? `，约 ${mins} 分钟` : ''}）
+                    ⟳ 补齐收藏/评论（本轮 {batchSize} 条，约 {mins} 分钟）
                   </button>
                 );
               })()}
@@ -400,26 +415,26 @@ export default function BenchmarksPage({ onAskAgent, onBreakdown }: BenchmarksPa
                   title="刷新时同步本地素材：没下载过的补下素材（图文约 1～17MB；视频按最低画质，约 5～35MB），已下载的只更新点赞/收藏/评论">
                   同步下载
                   <select value={syncBudget} onChange={(e) => setSyncBudget(Number(e.target.value))}>
-                    <option value={0}>不下（只更新数据）</option>
+                    <option value={0}>仅刷新列表（默认）</option>
+                    <option value={3}>最多 3 条</option>
                     <option value={5}>最多 5 条</option>
-                    <option value={10}>最多 10 条</option>
-                    <option value={20}>最多 20 条</option>
-                    <option value={999}>全部补齐</option>
                   </select>
                 </label>
               )}
               <button className="btn btn-sm btn-primary"
                 onClick={() => refresh(detail.account)}
                 disabled={detail.account.running || (detail.cooldown_left ?? 0) > 0}
-                title="重新抓主页列表，并同步本地素材：没下载过的下载素材，下载过的只更新点赞/收藏/评论">
+                title="重新抓主页列表；选择同步预算后才会读取详情和下载素材">
                 {detail.account.running
                   ? '抓取中…'
-                  : (detail.cooldown_left ?? 0) > 0 ? `冷却 ${detail.cooldown_left}s` : '⟳ 获取最新作品（含同步）'}
+                  : (detail.cooldown_left ?? 0) > 0 ? `冷却 ${detail.cooldown_left}s` : syncBudget > 0 ? '⟳ 获取最新作品并按预算同步' : '⟳ 获取最新作品'}
               </button>
             </>
           )}
         </div>
       </div>
+
+      <XhsAccessBanner status={xhsAccess} />
 
       {err && <div className="bench-err">{err}</div>}
 

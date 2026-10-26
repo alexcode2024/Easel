@@ -6,6 +6,8 @@ All notable changes to Easel are documented in this file.
 
 ### Added
 
+- Added a shared Xiaohongshu access queue and CLI process lock for the configured Cookie/browser login state (concurrency fixed at one), persistent risk cooldown, request pacing/budgets, and benchmark queue/risk status. Added offline serialization, cancellation, cross-process and circuit-breaker regression tests. See [docs/benchmarks.md](docs/benchmarks.md).
+- Reduced Xiaohongshu benchmark refreshes to 20 list entries without automatic detail collection or media downloads; explicit synchronization reads at most 8 details and defaults to 5 new downloads. Cached details are rechecked after queueing, rate-limited media downloads stop without trying another CDN, and session-check timeouts allow for request pacing.
 - Added a sanitized Linux deployment and troubleshooting record covering isolated runtimes, systemd user services, model configuration, Xiaohongshu Cookie authentication, and verification commands. See [docs/linux-deployment.md](docs/linux-deployment.md).
 - Added per-note performance monitoring to benchmark accounts: each work card has a monitoring switch that samples likes/favorites/comments once a day at a fixed time (default 09:00, editable) for up to 15 consecutive days, plus a 「📈 趋势」 button that opens line charts (likes / favorites / comments) for the last 15 days; platforms that publish view counts (TikTok) get an extra 播放量 line. Days that were not sampled stay as gaps instead of being interpolated, a failed re-sample never overwrites a good reading, and the monitor stops automatically when the 15-day window ends. See [docs/benchmarks.md](docs/benchmarks.md#5-作品表现监控15-天趋势).
 
@@ -22,6 +24,7 @@ All notable changes to Easel are documented in this file.
 
 ### Changed
 
+- Changed Xiaohongshu benchmark refreshes to fetch only the latest 20 works by default; detail/media synchronization is now explicit, detail batches and monitoring rounds are capped at 20, and synchronization defaults to five new downloads with an eight-detail-request budget. Risk signals stop the whole operation without retrying through a guest fallback.
 - Changed the performance-trend x-axis to start at the first day that has data instead of always spanning the last 15 days, so the first sample sits at the left edge instead of being pushed to the far right; while monitoring is active the axis still ends today, and after it stops it ends at the last sample.
 - Changed the benchmark work list from a card grid to a detail list: one row per work with the cover on the left, then title / published time / last-sampled time / original link beside it, followed by read (play), like, favorite and comment columns, a per-row monitoring switch and an actions cell (trend, download, ⋯ menu for breakdown / save-to-ideas / deep dive). Columns collapse on narrower windows and rows stack below 1100px.
 - Changed the benchmark page to use the workbench's centered content column like every other page, and widened that column to 1280px for this page only (others stay 1100px) so the seven-column work list keeps a readable title; the list drops to five columns between 1021 and 1250px and stacks below 1020px.
