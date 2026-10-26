@@ -6,6 +6,7 @@ All notable changes to Easel are documented in this file.
 
 ### Added
 
+- Added `docs/platform-adapter-guide.md` as the required standard for future platform integrations, covering shared access contracts, normalized benchmark data models, adapter capabilities, offline tests, and a repository-level instruction that directs agents to read it before implementation.
 - Added a platform-neutral access contract (`AccessResource`, `AccessPolicy`, and `PlatformAdapter`) with per-platform policy adapters, FIFO Web queue, cross-process lock inheritance, risk state, browser guards, and a multi-platform status banner. Registered Xiaohongshu, Douyin, and TikTok policies; TikTok access guarding currently covers benchmark fetching only. See [docs/platform-access.md](docs/platform-access.md).
 - Preserved Xiaohongshu's existing Cookie/browser concurrency, 8–15 second request pacing, persistent risk state, and CLI request budgets behind the shared access contract; added offline serialization, cancellation, cross-process and breaker regression tests. See [docs/benchmarks.md](docs/benchmarks.md).
 - Reduced Xiaohongshu benchmark refreshes to 20 list entries without automatic detail collection or media downloads; explicit synchronization reads at most 8 details and defaults to 5 new downloads. Cached details are rechecked after queueing, rate-limited media downloads stop without trying another CDN, and session-check timeouts allow for request pacing.
