@@ -33,6 +33,19 @@
 
 不同平台继续各自处理；普通抓取错误不触发平台批次停止。跳过的账号计入批次完成进度，列表与账号详情展示跳过提示。即使暂停在本批次期间解除，本批次已跳过的账号也不会自动恢复执行。
 
+## 小红书浏览器配置
+
+`skills/shared/scripts/xhs_browser.py` 是小红书浏览器身份的唯一配置入口，平台差异留在小红书模块内部：
+
+- Cookie HTTP 请求固定为 `chrome152`（Windows 桌面），User-Agent、`sec-ch-ua`、移动端标记、平台和 `xhshow` 签名内嵌 User-Agent 使用同一版本，不使用会随依赖升级漂移的 `chrome` 别名。依赖最低版本为 `curl-cffi 0.17`。
+- 用户提供的 Windows Chrome 155 Header 用来确认桌面平台和语言；当前依赖不支持 Chrome 155 指纹，因此不单独把版本号声明成 155。HTTP 模拟配置不等同于原 Windows 浏览器的完整运行环境。
+- 语言统一为 `zh-CN,zh;q=0.9,zh-TW;q=0.8`。文档、API 和媒体按用途生成 Accept / Origin / Referer / Fetch Metadata；关闭 curl_cffi 自动浏览器请求头，避免 API 混入导航头。签名按实际接口和参数生成，Cookie 保持原有传递范围，不复制请求的 Host、长度或 HTTP/2 伪头。
+- 账号指标、作品列表、作品详情、Cookie 登录校验、媒体及封面下载共用 HTTP 配置。CDN 下载不附加账号 Cookie。
+- Playwright 对标浏览器、扫码登录、发布及自有账号数据读取共用中文、上海时区和 1440×900 窗口设置，保留真实内核的 User-Agent / Client Hints；不把 Linux 原生浏览器的版本和平台强制声明成 Windows Chrome 152。
+- 现有公共队列、同凭证并发 1、8–15 秒间隔、预算与熔断保持既有行为；此次配置统一不清除平台暂停，也不意味着能消除 HTTP 461。
+
+`tests/test_xhs_browser.py` 用本机回显服务器核对实际 HTTP Header，并通过 mock 验证签名、详情、列表和封面配置。所有验证不访问小红书。
+
 ## 小红书响应识别
 
 小红书由 `platform_adapters.py::XiaohongshuPolicyAdapter` 在适配器内部解释验证信号，共用队列和请求层无需平台分支：

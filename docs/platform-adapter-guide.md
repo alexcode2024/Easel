@@ -28,6 +28,8 @@
 
 Web、CLI、后台任务和浏览器请求必须使用相同的平台键与凭证身份。当前每个平台的默认登录态使用 `account_id="default"`；未来多账号时，由账号管理层提供稳定 credential ID，再让所有入口统一传递该 ID。
 
+平台若需要声明 HTTP 浏览器身份，应在自身模块集中管理传输目标、User-Agent、Client Hints、语言和签名库身份，并使用依赖实际支持的固定版本；浏览器原生运行时保留真实内核身份。可参考 `xhs_browser.py`，不在公共访问层硬编码某平台请求头。升级配置需验证实际发送头与签名配置的一致性。
+
 ## 3. 对标账号公共数据模型
 
 如新增平台对标账号抓取，适配 `skills/shared/scripts/benchmark_fetch.py` 的 `Adapter`，返回统一的 `Snapshot` / `Work`。Web 层只消费这些结构，不消费平台原始 JSON。

@@ -51,14 +51,14 @@ import sys
 import time
 from pathlib import Path
 import xhs_access
+import xhs_browser
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 PROFILE_NAME = "XiaohongshuProfile"
 PROFILE_ROOT = Path.home() / ".easel-browser-profiles"
-UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-      "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+UA = xhs_browser.USER_AGENT  # compatibility export; configuration lives in xhs_browser
 
 STEADY_MIN = xhs_access.REQUEST_DELAY_MIN
 STEADY_MAX = xhs_access.REQUEST_DELAY_MAX
@@ -161,22 +161,20 @@ def _state_from_html(html: str) -> dict:
     return state if isinstance(state, dict) else {}
 
 
-def _http_get(url: str, cookie: str = "", *, impersonate: str = "chrome", timeout: int = 20):
+def _http_get(url: str, cookie: str = "", *, impersonate: str = xhs_browser.IMPERSONATE, timeout: int = 20):
     """带 TLS 指纹伪装的 HTTP GET。
 
-    普通 HTTP 客户端（requests/urllib）以及 Playwright 无头内核都会被小红书判 300012；
-    curl_cffi 伪装真实 Chrome 指纹后反而最稳（做法参考 XHS-Downloader）。
+    使用集中配置的 Chrome HTTP/TLS 模拟目标；该配置不保证平台接受请求。
+    Cookie 与请求节奏仍由既有账号访问层管理。
     """
     from curl_cffi import requests as creq
 
-    headers = {
-        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
-                  "image/avif,image/webp,image/apng,*/*;q=0.8",
-        "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
-        "referer": "https://www.xiaohongshu.com/",
-    }
-    return xhs_access.request(creq.get, url, headers=headers, cookies=parse_cookie(cookie) if cookie else None,
-                    timeout=timeout, verify=False, allow_redirects=True, impersonate=impersonate)
+    if impersonate != xhs_browser.IMPERSONATE:
+        raise ValueError("小红书 HTTP 浏览器配置须统一，不能单独覆盖 impersonate")
+    return xhs_access.request(
+        creq.get, url, **xhs_browser.http_options("document"),
+        cookies=parse_cookie(cookie) if cookie else None,
+        timeout=timeout, verify=False, allow_redirects=True)
 
 
 def parse_cookie(cookie: str) -> dict:
@@ -193,7 +191,7 @@ def parse_cookie(cookie: str) -> dict:
     return jar
 
 
-def fetch_profile_http(user_id: str, cookie: str, *, impersonate: str = "chrome",
+def fetch_profile_http(user_id: str, cookie: str, *, impersonate: str = xhs_browser.IMPERSONATE,
                        timeout: int = 20) -> dict:
     """纯 HTTP 读主页（**带 cookie 才有真实数据**）——不用浏览器。
 
@@ -248,7 +246,7 @@ def fetch_profile_http(user_id: str, cookie: str, *, impersonate: str = "chrome"
 
 
 def fetch_note_detail(work_id: str, xsec_token: str = "", *, cookie: str = "",
-                      impersonate: str = "chrome", timeout: int = 20,
+                      impersonate: str = xhs_browser.IMPERSONATE, timeout: int = 20,
                       referer: str = "https://www.xiaohongshu.com/") -> dict:
     """纯 HTTP 读单条笔记的互动数据（点赞/收藏/评论/分享）——**不用浏览器、不用登录**。
 
@@ -297,21 +295,14 @@ def _signed_api_get(endpoint: str, params: dict, cookie: str, *, timeout: int = 
     自己 urlencode 拼出来的参数顺序与库内部不一致时会 406（实测踩过）。
     """
     from curl_cffi import requests as creq
-    from xhshow import Xhshow
 
     jar = parse_cookie(cookie)
-    signer = Xhshow()
+    signer = xhs_browser.signer()
     url = signer.build_url(endpoint, params)
-    headers = signer.sign_headers_get(uri=endpoint, cookies=jar, params=params) | {
-        "accept": "application/json, text/plain, */*",
-        "accept-language": "zh-CN",
-        "origin": "https://www.xiaohongshu.com",
-        "referer": referer,
-        "sec-fetch-dest": "empty", "sec-fetch-mode": "cors", "sec-fetch-site": "same-site",
-        "user-agent": UA,
-    }
-    return xhs_access.request(creq.get, url, headers=headers, cookies=jar, timeout=timeout, verify=False,
-                    allow_redirects=True, impersonate="chrome")
+    options = xhs_browser.http_options("api", referer=referer)
+    options["headers"] = signer.sign_headers_get(uri=endpoint, cookies=jar, params=params) | options["headers"]
+    return xhs_access.request(creq.get, url, **options, cookies=jar, timeout=timeout, verify=False,
+                              allow_redirects=True)
 
 
 def fetch_otherinfo(user_id: str, cookie: str) -> dict:
@@ -434,21 +425,13 @@ def fetch_profile_paged(user_id: str, cookie: str, *, limit: int = 0,
     2. ``xsec_token``/``xsec_source`` 传空串即可（浏览器真实请求里就是空的）。
     """
     from curl_cffi import requests as creq
-    from xhshow import Xhshow
 
     jar = parse_cookie(cookie)
     if not jar:
         raise RuntimeError("cookie 为空，无法调用签名接口")
-    signer = Xhshow()
+    signer = xhs_browser.signer()
     endpoint = "https://edith.xiaohongshu.com/api/sns/web/v1/user_posted"
-    common_headers = {
-        "accept": "application/json, text/plain, */*",
-        "accept-language": "zh-CN",
-        "origin": "https://www.xiaohongshu.com",
-        "referer": "https://www.xiaohongshu.com/",
-        "sec-fetch-dest": "empty", "sec-fetch-mode": "cors", "sec-fetch-site": "same-site",
-        "user-agent": UA,
-    }
+    options = xhs_browser.http_options("api")
     throttle = throttle or Throttle(*threshold)
     notes: list[dict] = []
     seen: set[str] = set()
@@ -467,8 +450,9 @@ def fetch_profile_paged(user_id: str, cookie: str, *, limit: int = 0,
         url = signer.build_url(endpoint, params)      # 必须用库的 URL：签名覆盖查询串
         headers = signer.sign_headers_get(uri=endpoint, cookies=jar, params=params)
         throttle.wait()
-        response = xhs_access.request(creq.get, url, headers=headers | common_headers, cookies=jar, timeout=25,
-                            verify=False, allow_redirects=True, impersonate="chrome")
+        response = xhs_access.request(creq.get, url,
+                            **(options | {"headers": headers | options["headers"]}), cookies=jar, timeout=25,
+                            verify=False, allow_redirects=True)
         pages += 1
         if response.status_code != 200:
             raise RuntimeError(f"分页接口 HTTP {response.status_code}（第 {pages} 页）")
@@ -721,24 +705,20 @@ def fetch(user_id: str, *, anonymous: bool, throttle: Throttle, limit: int,
             if anonymous:
                 browser = p.chromium.launch(
                     headless=headless, args=["--disable-blink-features=AutomationControlled"])
-                ctx = browser.new_context(user_agent=UA, locale="zh-CN",
-                                          viewport={"width": 1440, "height": 900})
+                ctx = browser.new_context(**xhs_browser.context_options())
                 ctx_kind = "anonymous"
             else:
                 profile = PROFILE_ROOT / PROFILE_NAME
                 if not profile.is_dir():
                     log.append(f"[!] 持久化 profile 不存在：{profile} —— 回退匿名")
                     browser = p.chromium.launch(headless=headless)
-                    ctx = browser.new_context(user_agent=UA, locale="zh-CN",
-                                              viewport={"width": 1440, "height": 900})
+                    ctx = browser.new_context(**xhs_browser.context_options())
                     ctx_kind = "anonymous (profile missing)"
                 else:
                     # 有头（本机 Chrome 内核）：无头 Playwright Chromium 会被小红书判 300012，
                     # 同一网络下有头正常。生产调用一律走这里（--headless 仅留给离线自检）。
                     launch_kwargs: dict = dict(
-                        headless=headless, user_agent=UA, locale="zh-CN",
-                        timezone_id="Asia/Shanghai",
-                        viewport={"width": 1440, "height": 900},
+                        headless=headless, **xhs_browser.context_options(),
                         args=["--disable-blink-features=AutomationControlled"])
                     channel = _browser_channel()
                     if not headless and channel:
@@ -888,7 +868,7 @@ def main(argv: list[str] | None = None) -> int:
             return 4
 
     if cookie:
-        # 有 cookie 就走纯 HTTP：不用浏览器、没有无头检测、不会 300012。
+        # 有 cookie 就走统一身份的纯 HTTP；平台风险响应仍会触发熔断。
         # 指标走 otherinfo 接口、作品走 user_posted 分页接口 —— 因为**带 cookie 时
         # 主页 SSR 是登录态空壳**（实测 10KB、没有 __INITIAL_STATE__），读不到任何数据。
         try:

@@ -17,6 +17,8 @@ All notable changes to Easel are documented in this file.
 
 ### Fixed
 
+- Unified Xiaohongshu Cookie HTTP identity in `xhs_browser.py`: pinned Windows Chrome 152 transport, matching User-Agent/Client Hints and xhshow signing identity, consistent language, and request-specific headers across account refresh, detail sampling, identity checks and CDN downloads. Browser contexts share locale/timezone/viewport while retaining native engine identity. Raised curl-cffi's minimum to 0.17 and added loopback header and mocked integration checks.
+
 - Stopped scheduling remaining benchmark refreshes for a paused platform within “Refresh all”; untouched accounts show “因平台暂停而跳过” and count toward batch completion. Other platforms continue, ordinary errors do not stop a platform, and skipped accounts keep their cached data and cooldowns.
 
 - Fixed Xiaohongshu HTML checks falsely pausing normal note pages on `redOfficialVerifyType`: its adapter now checks page text and explicit challenge destinations while ignoring scripts, styles, comments and attributes; HTTP/JSON risk checks remain active. Added offline response regressions and replayed the privately captured normal page successfully without another platform request.

@@ -41,6 +41,7 @@ import login_state  # noqa: E402
 import login_qr
 import login_transport
 import xhs_access
+import xhs_browser
 import content_guard  # noqa: E402  出站内容安全闸门
 
 # --------------------------------------------------------------------------- #
@@ -1067,7 +1068,7 @@ def _launch(p, headed: bool, base: str | None, proxy: str | None, *, login_asset
     profile.mkdir(parents=True, exist_ok=True)
     args = list(LAUNCH_ARGS)
     kwargs = dict(headless=not headed,
-                  locale="zh-CN",
+                  **xhs_browser.context_options(),
                   args=args)
     if proxy:
         kwargs["proxy"] = {"server": proxy}
@@ -1523,22 +1524,15 @@ def _whoami_via_cookie(cookie_file: str) -> int:
 
         import xhs_fetch  # 同目录的抓取模块，复用其 cookie 解析
 
-        from xhshow import Xhshow
-
         jar = xhs_fetch.parse_cookie(cookie)
-        signer = Xhshow()
+        signer = xhs_browser.signer()
         endpoint = "https://edith.xiaohongshu.com/api/sns/web/v2/user/me"
         params: dict = {}
         url = signer.build_url(endpoint, params)      # 必须用库的 URL：签名覆盖查询串
-        headers = signer.sign_headers_get(uri=endpoint, cookies=jar, params=params) | {
-            "accept": "application/json, text/plain, */*",
-            "accept-language": "zh-CN",
-            "origin": "https://www.xiaohongshu.com",
-            "referer": "https://www.xiaohongshu.com/",
-            "user-agent": xhs_fetch.UA,
-        }
-        response = xhs_access.request(creq.get, url, headers=headers, cookies=jar, timeout=20, verify=False,
-                            allow_redirects=True, impersonate="chrome")
+        options = xhs_browser.http_options("api")
+        options["headers"] = signer.sign_headers_get(uri=endpoint, cookies=jar, params=params) | options["headers"]
+        response = xhs_access.request(creq.get, url, **options, cookies=jar, timeout=20, verify=False,
+                                      allow_redirects=True)
         body = response.json() if response.status_code == 200 else {}
         data = body.get("data") or {}
         if body.get("success") and data.get("user_id"):

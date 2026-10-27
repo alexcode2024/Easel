@@ -29,8 +29,12 @@ def test_cookie_identity_uses_signed_http_dependencies(tmp_path, monkeypatch, ca
     assert result["loggedIn"] is True
     assert result["name"] == "My account"
     assert result["sessions"]["web"]["ok"] is True
-    assert request.call_args.kwargs["impersonate"] == "chrome"
+    assert request.call_args.kwargs["impersonate"] == "chrome152"
     assert request.call_args.kwargs["cookies"]["web_session"] == "test-session"
+    import xhs_browser
+    options = xhs_browser.http_options("api")
+    assert request.call_args.kwargs["default_headers"] is False
+    assert request.call_args.kwargs["headers"] == {"x-s": "test-signature"} | options["headers"]
 
 
 def html_state(user):

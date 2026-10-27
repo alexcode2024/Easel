@@ -31,6 +31,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import xhs_fetch as xf  # noqa: E402  复用 HTTP（指纹伪装）与 YAML 解析
 import xhs_access
+import xhs_browser
 
 __all__ = ["parse_note", "download_note", "pick_video", "image_original_url", "guess_ext"]
 
@@ -322,8 +323,8 @@ def _download(urls, dest: Path, *, referer: str, limit: int = MAX_FILE_BYTES) ->
                 xhs_access.check_breaker()
             result["url"] = url
             # 注意：curl_cffi 的 Response 不支持 with 语句（实测 TypeError），手动关闭
-            response = creq.get(url, headers={"referer": referer}, timeout=180, verify=False,
-                                allow_redirects=True, impersonate="chrome", stream=True)
+            response = creq.get(url, **xhs_browser.http_options("media", referer=referer),
+                                timeout=180, verify=False, allow_redirects=True, stream=True)
             xhs_access.inspect_status(response)
             if response.status_code not in (200, 206):
                 last_error = f"HTTP {response.status_code}"

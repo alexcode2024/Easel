@@ -334,11 +334,13 @@ def _cover_ext(url: str, content_type: str = "") -> str:
     return ".jpg"
 
 
-def download_cover(url: str, dest_dir: Path, stem: str, referer: str = "") -> str:
+def download_cover(url: str, dest_dir: Path, stem: str, referer: str = "", *,
+                   read_response=None) -> str:
     """下载封面到 ``dest_dir/<stem>.<ext>``，返回相对 dest_dir 的文件名；失败返回 ""。
 
     图片走平台 CDN，普通 GET 即可（前端展示时也是 no-referrer）。
     下载失败**不是**致命错误：保留远程 URL 让前端直接显示。
+    平台适配器可用 read_response(url, referer) 提供自己的有界读取传输。
     """
     url = _https(url)
     if not url:
@@ -351,9 +353,12 @@ def download_cover(url: str, dest_dir: Path, stem: str, referer: str = "") -> st
         **({"Referer": referer} if referer else {}),
     })
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:  # noqa: S310 - 固定 https
-            data = resp.read(8 * 1024 * 1024)
-            ctype = resp.headers.get("Content-Type", "")
+        if read_response is not None:
+            data, ctype = read_response(url, referer)
+        else:
+            with urllib.request.urlopen(req, timeout=20) as resp:  # noqa: S310 - 固定 https
+                data = resp.read(8 * 1024 * 1024)
+                ctype = resp.headers.get("Content-Type", "")
     except (urllib.error.URLError, TimeoutError, OSError, ValueError):
         return ""
     if not data:
@@ -523,12 +528,15 @@ class XiaohongshuAdapter(Adapter):
         snap.median_likes = mark_burst(works)
 
         if cover_dir is not None:
+            import xhs_browser
             missing = 0
             for w in works:
                 if not w.cover_url:
                     continue
                 stem = cover_stem(w.cover_url, w.id, w.title, w.published_at_ms)
-                name = download_cover(w.cover_url, Path(cover_dir), stem)
+                name = download_cover(w.cover_url, Path(cover_dir), stem,
+                                      referer="https://www.xiaohongshu.com/",
+                                      read_response=xhs_browser.read_cover)
                 if name:
                     w.cover = name
                 else:
