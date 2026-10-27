@@ -2,14 +2,27 @@ import type { PlatformAccessStatus } from '../lib/api';
 
 export default function PlatformAccessBanner({
   statuses,
+  showIdle = false,
+  error = '',
 }: {
   statuses: Record<string, PlatformAccessStatus> | null;
+  showIdle?: boolean;
+  error?: string;
 }) {
-  if (!statuses) return null;
-  const visible = Object.values(statuses).filter((status) =>
+  const visible = Object.values(statuses || {}).filter((status) =>
     status.risk.active || status.active || status.queued || status.external_busy,
   );
-  if (!visible.length) return null;
+  if (error || !statuses || !visible.length) {
+    if (!showIdle) return null;
+    return (
+      <div className="platform-access-list" role="status">
+        <div className="platform-access-bar">
+          <span className="platform-access-dot" />
+          访问队列：{error || (!statuses ? '正在读取状态…' : '当前空闲，暂无排队任务')}
+        </div>
+      </div>
+    );
+  }
   return (
     <div className="platform-access-list" role="status">
       {visible.map((status) => (

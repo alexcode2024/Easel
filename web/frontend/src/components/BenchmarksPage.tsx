@@ -73,6 +73,7 @@ export default function BenchmarksPage({ onAskAgent, onBreakdown }: BenchmarksPa
   const [busyWork, setBusyWork] = useState('');
   const [syncBudget, setSyncBudget] = useState(0);
   const [cookies, setCookies] = useState<BenchCookieStatus[]>([]);
+  const [platformAccessError, setPlatformAccessError] = useState('');
   const [platformAccess, setPlatformAccess] = useState<Record<string, PlatformAccessStatus> | null>(null);
   const [cookieForm, setCookieForm] = useState<{ platform: string; value: string } | null>(null);
   // 表现监控：设置（每天几点采样）+ 正在跑的那一轮进度；趋势弹窗针对单篇作品
@@ -101,7 +102,10 @@ export default function BenchmarksPage({ onAskAgent, onBreakdown }: BenchmarksPa
   }, []);
 
   const loadPlatformAccess = useCallback(() => {
-    fetchPlatformAccessStatus().then(setPlatformAccess).catch(() => setPlatformAccess(null));
+    fetchPlatformAccessStatus().then((statuses) => {
+      setPlatformAccess(statuses);
+      setPlatformAccessError('');
+    }).catch(() => setPlatformAccessError('状态读取失败，正在重试…'));
   }, []);
 
   const loadDetail = useCallback((id: string) => {
@@ -372,7 +376,7 @@ export default function BenchmarksPage({ onAskAgent, onBreakdown }: BenchmarksPa
             盯住同赛道账号在发什么、哪条跑出来了。数据来自平台<strong>公开</strong>信息，
             平台不公开的字段显示「—」，不估算。
           </p>
-          <PlatformAccessBanner statuses={platformAccess} />
+          <PlatformAccessBanner statuses={platformAccess} showIdle error={platformAccessError} />
         </div>
         <div style={{ display: 'flex', gap: 8 }}>
           {selected && <button className="btn btn-sm" onClick={() => setSelected(null)}>← 返回列表</button>}

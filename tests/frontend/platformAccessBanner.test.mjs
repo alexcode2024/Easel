@@ -41,3 +41,15 @@ test('queue banner displays the active task and this task position', () => {
 test('idle access status does not render a banner', () => {
   assert.equal(renderToStaticMarkup(React.createElement(exports.default, { statuses: { xiaohongshu: idle } })), '');
 });
+
+
+test('persistent queue banner displays idle, loading and failed status explicitly', () => {
+  const renderPersistent = (statuses, error = '') => renderToStaticMarkup(
+    React.createElement(exports.default, { statuses, showIdle: true, error }),
+  );
+  assert.match(renderPersistent({ xiaohongshu: idle }), /当前空闲，暂无排队任务/);
+  assert.match(renderPersistent(null), /正在读取状态/);
+  const failed = renderPersistent({ xiaohongshu: idle }, '状态读取失败，正在重试…');
+  assert.match(failed, /状态读取失败/);
+  assert.doesNotMatch(failed, /当前空闲/);
+});

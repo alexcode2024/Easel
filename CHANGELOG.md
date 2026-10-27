@@ -15,6 +15,8 @@ All notable changes to Easel are documented in this file.
 
 ### Fixed
 
+- Kept benchmark queue status visible below the page title during idle, loading and status-query failures; retained current tasks and queue positions in work trend dialogs. Documented rebuilding the frontend and restarting the Web service together when deploying API changes.
+
 - Unified the shared Xiaohongshu request interval and fetch defaults at a random 8–15 seconds; single-account concurrency remains one, with existing request budgets and risk cooldown unchanged.
 - Fixed custom OpenClaw providers being reported as unconfigured when their primary model's API key is stored in OpenClaw rather than `.env`; malformed configuration still falls back to valid environment-file credentials.
 - Fixed saved chat-model settings not taking effect in a running OpenClaw gateway: the settings panel now restarts the gateway after saving and reports restart failures without resubmitting the saved configuration. Direct-API and media configuration saves do not restart it.
