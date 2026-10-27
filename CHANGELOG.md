@@ -17,6 +17,8 @@ All notable changes to Easel are documented in this file.
 
 ### Fixed
 
+- Fixed Xiaohongshu HTML checks falsely pausing normal note pages on `redOfficialVerifyType`: its adapter now checks page text and explicit challenge destinations while ignoring scripts, styles, comments and attributes; HTTP/JSON risk checks remain active. Added offline response regressions and replayed the privately captured normal page successfully without another platform request.
+
 - Kept benchmark queue status visible below the page title during idle, loading and status-query failures; retained current tasks and queue positions in work trend dialogs. Documented rebuilding the frontend and restarting the Web service together when deploying API changes.
 
 - Unified the shared Xiaohongshu request interval and fetch defaults at a random 8–15 seconds; single-account concurrency remains one, with existing request budgets and risk cooldown unchanged.
