@@ -500,6 +500,7 @@ export default function BenchmarksPage({ onAskAgent, onBreakdown }: BenchmarksPa
                             {st === 'running' ? '抓取中…' : a.fetched_at ? timeAgo(a.fetched_at * 1000) : '未抓取'}
                           </div>
                           {st === 'risk' && <div className="bench-tag danger">风控熔断</div>}
+                          {st === 'skipped' && <div className="bench-tag warn">{a.fetch?.message || '因平台暂停而跳过'}</div>}
                           {st === 'error' && <div className="bench-tag danger" title={a.last_error}>失败</div>}
                           {a.status === 'manual' && <div className="bench-tag">手动登记</div>}
                           {a.logged_in === false && <div className="bench-tag warn" title="登录态未生效，部分字段平台只给占位值">登录态失效</div>}
@@ -629,6 +630,9 @@ export default function BenchmarksPage({ onAskAgent, onBreakdown }: BenchmarksPa
 
           {detail.fetch?.state === 'risk' && (
             <div className="bench-err">平台风控熔断：{detail.fetch.message || '已停止，请数小时后再试'}</div>
+          )}
+          {detail.fetch?.state === 'skipped' && (
+            <div className="bench-note">{detail.fetch.message || '因平台暂停而跳过'}</div>
           )}
           {(detail.account.running || detail.fetch?.state === 'running') && detail.fetch?.message && (
             <div className="bench-note">{detail.fetch.message}</div>

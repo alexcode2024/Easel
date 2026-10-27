@@ -6600,9 +6600,23 @@ async def api_bench_fetch_all():
         raise HTTPException(400, "没有可自动抓取的对标账号")
 
     async def _run_all():
-        for a in accounts:
+        paused_platforms: set[str] = set()
+
+        def pause_remaining(platform: str, start: int) -> None:
+            paused_platforms.add(platform)
+            for pending in accounts[start:]:
+                pending_bid = pending.get("id", "")
+                if (pending.get("platform", "") == platform and pending_bid
+                        and not BENCH_RUNNING.get(pending_bid)):
+                    _bench_write_status(pending_bid, "skipped", "因平台暂停而跳过")
+
+        for index, a in enumerate(accounts):
             bid = a.get("id", "")
-            if not bid or BENCH_RUNNING.get(bid):
+            platform = a.get("platform", "")
+            if not bid or BENCH_RUNNING.get(bid) or platform in paused_platforms:
+                continue
+            if _platform_access_risk_status(platform).get("active"):
+                pause_remaining(platform, index)
                 continue
             BENCH_LAST_START[bid] = time.time()
             task = asyncio.create_task(_bench_run_fetch(bid))
@@ -6611,6 +6625,10 @@ async def api_bench_fetch_all():
                 await task
             except Exception:  # noqa: BLE001
                 pass
+            if (_bench_read_status(bid).get("state") == "risk"
+                    or _platform_access_risk_status(platform).get("active")):
+                pause_remaining(platform, index + 1)
+                continue
             await asyncio.sleep(2)   # 账号之间留间隔，避免连打
 
     BENCH_ALL_TASK = asyncio.create_task(_run_all())
@@ -6628,7 +6646,7 @@ async def api_bench_fetch_all_status():
         total += 1
         st = _bench_read_status(bid)
         states[bid] = st.get("state")
-        if st.get("state") in ("done", "error", "risk"):
+        if st.get("state") in ("done", "error", "risk", "skipped"):
             done += 1
     return {"running": bool(BENCH_ALL_TASK and not BENCH_ALL_TASK.done()),
             "done": done, "total": total, "states": states}

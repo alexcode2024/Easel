@@ -17,6 +17,8 @@ All notable changes to Easel are documented in this file.
 
 ### Fixed
 
+- Stopped scheduling remaining benchmark refreshes for a paused platform within “Refresh all”; untouched accounts show “因平台暂停而跳过” and count toward batch completion. Other platforms continue, ordinary errors do not stop a platform, and skipped accounts keep their cached data and cooldowns.
+
 - Fixed Xiaohongshu HTML checks falsely pausing normal note pages on `redOfficialVerifyType`: its adapter now checks page text and explicit challenge destinations while ignoring scripts, styles, comments and attributes; HTTP/JSON risk checks remain active. Added offline response regressions and replayed the privately captured normal page successfully without another platform request.
 
 - Kept benchmark queue status visible below the page title during idle, loading and status-query failures; retained current tasks and queue positions in work trend dialogs. Documented rebuilding the frontend and restarting the Web service together when deploying API changes.
